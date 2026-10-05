@@ -1,0 +1,15 @@
+.venv/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+*.pyc
+profiles/
+temp/
+/build/
+/dist/
+/logs/
+/reports/
+/settings.json
+/surface_profiles.json
+/pacenote_overrides.json
+rbr2beamng/bin/

@@ -1,0 +1,53 @@
+xatlas core
+===========
+
+The xatlas Python binding includes the xatlas C++ core:
+
+MIT License
+
+Copyright (c) 2018-2020 Jonathan Young
+Copyright (c) 2013 Thekla, Inc
+Copyright NVIDIA Corporation 2006 -- Ignacio Castano
+Copyright (c) 2012 Brandon Pelfrey
+
+The full MIT License text appears above under xatlas-python.
+
+CPython runtime components
+==========================
+
+OpenSSL 3 is licensed under Apache License 2.0. The full Apache License 2.0
+text appears above under PyInstaller.
+
+The pyexpat extension includes Expat:
+
+Copyright (c) 1998, 1999, 2000 Thai Open Source Software Center Ltd
+and Clark Cooper
+
+The _ctypes extension includes libffi:
+
+Copyright (c) 1996-2008 Red Hat, Inc and others.
+
+The full MIT License text appears above under assimp-py and xatlas-python.
+
+The _lzma extension includes liblzma:
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+NASA POWER attribution
+======================
+
+The autumn temperature values in rbr2beamng/data/locations.json, and the summer
+and winter values of Brazil, China, Kenya, Latvia and San Marino, use NASA POWER
+2001-2020 daily climatology. The data was obtained from the National Aeronautics
+and Space Administration (NASA) Langley Research Center's Prediction Of
+Worldwide Energy Resources (POWER) Project funded through the NASA Earth Science
+Division. See https://power.larc.nasa.gov/docs/referencing/.

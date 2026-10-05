@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rbr2beamng"
+dynamic = ["version"]
+description = "Convert RBR RX and Original RBR stages into BeamNG.drive levels"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "askynet", email = "a.skynet.1997@gmail.com" }]
+dependencies = [
+    "assimp-py==1.1.0",
+    "numpy==2.4.4; python_version < '3.12'",
+    "numpy==2.5.2; python_version >= '3.12'",
+    "Pillow==12.3.0",
+    "pypdfium2==5.13.0",
+    "xatlas==0.0.11",
+    "zlib-ng==1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller==6.22.2",
+    "pytest==9.1.1",
+]
+
+[project.scripts]
+rbr2beamng-cli = "rbr2beamng.cli:main"
+
+[project.gui-scripts]
+RBR2BeamNG = "rbr2beamng.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rbr2beamng*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "rbr2beamng.__version__" }
+
+[tool.setuptools.package-data]
+rbr2beamng = [
+    "licenses/*",
+    "licenses/**/*",
+    "data/*",
+    "bin/VERSION.txt",
+    "bin/*/LICENSE",
+    "bin/*/THIRD_PARTY_LICENSES.txt",
+    "bin/windows-x64/texconv.exe",
+    "bin/linux-x64/texconv",
+    "bin/macos-universal/texconv",
+]
