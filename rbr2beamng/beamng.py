@@ -1244,6 +1244,10 @@ def write_materials(
                     "subSurfaceIntensity": 1,
                 }
             )
+            # Version 1.5 always adds a 4 % specular reflection, which turns
+            # dark sunlit vegetation sprites grey; version 1.0 has none by default.
+            if transparent:
+                entry["version"] = 1.0
         if transparent and has_opacity:
             if blend_pass:
                 entry.update(_BLEND_PASS_PROFILE)

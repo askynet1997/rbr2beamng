@@ -288,6 +288,53 @@ def _structured_vector(values: np.ndarray, field: str) -> np.ndarray:
     return result
 
 
+_BAKED_SHADE_REFERENCE = 0.33
+_BAKED_SHADE_CONTRAST = 0.5
+_LUMINANCE_WEIGHTS = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32)
+
+
+def _soften_baked_shade(colors: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    """Scale baked colours, then compress shade darker than the reference.
+
+    Baked colours hold canopy and terrain shade that BeamNG neither applies to
+    the car nor needs on top of its own shadows, so below the reference their
+    luminance keeps only part of its contrast (in log terms). Hue and alpha
+    are kept.
+    """
+    result = colors.copy()
+    result[:, :3] *= scale
+    luminance = result[:, :3] @ _LUMINANCE_WEIGHTS
+    shaded = (luminance > 0.0) & (luminance < _BAKED_SHADE_REFERENCE)
+    lifted = _BAKED_SHADE_REFERENCE * (luminance[shaded] / _BAKED_SHADE_REFERENCE) ** _BAKED_SHADE_CONTRAST
+    result[shaded, :3] = np.minimum(result[shaded, :3] * (lifted / luminance[shaded])[:, None], 1.0)
+    return result
+
+
+def _baked_color_scale(colors: np.ndarray) -> float:
+    """Scale moving one kind of baked colour's median toward the reference.
+
+    Stage tools bake at very different levels, from about 0.2 to pure white
+    for open ground. Under BeamNG's auto exposure a bright world makes the
+    car look dim, so a kind brighter than the reference keeps only part of
+    its ratio to it, like shade below the reference does.
+    """
+    if not len(colors):
+        return 1.0
+    median = float(np.median(colors[:, :3] @ _LUMINANCE_WEIGHTS))
+    if median <= _BAKED_SHADE_REFERENCE:
+        return 1.0
+    return (_BAKED_SHADE_REFERENCE / median) ** (1.0 - _BAKED_SHADE_CONTRAST)
+
+
+def _parts_color_scale(parts: Sequence[MeshPart]) -> float:
+    shown = [part.colors for part in parts if part.lod_kind != "far"]
+    return _baked_color_scale(np.concatenate(shown)) if shown else 1.0
+
+
+def _bake_colors(parts: Sequence[MeshPart], scale: float) -> list[MeshPart]:
+    return [replace(part, colors=_soften_baked_shade(part.colors, scale)) for part in parts]
+
+
 def _colors(values: np.ndarray) -> np.ndarray:
     names = values.dtype.names
     if names is None or "color" not in names:
@@ -380,6 +427,75 @@ def _triangle_soup_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarra
     normals = np.empty(vertices.shape, dtype=np.float32)
     normals[faces] = face_normals.astype(np.float32)[:, None, :]
     return normals
+
+
+def _position_smoothed_normals(parts: Sequence[MeshPart]) -> list[np.ndarray]:
+    """Area-weighted normals over every face touching a position, per part.
+
+    A vertex keeps its own normal where the faces around it cancel out or
+    point away from it, as back-to-back faces do.
+    """
+    vertices = np.concatenate([part.vertices for part in parts]).astype(np.float64)
+    starts = np.cumsum([0, *(len(part.vertices) for part in parts)])
+    faces = np.concatenate(
+        [
+            np.asarray(part.faces, dtype=np.int64) + start
+            for part, start in zip(parts, starts)
+        ]
+    )
+    positions, welded = np.unique(
+        np.round(vertices * 1000.0).astype(np.int64),
+        axis=0,
+        return_inverse=True,
+    )
+    welded = welded.reshape(-1)
+    triangles = vertices[faces]
+    face_normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    sums = np.zeros((len(positions), 3), dtype=np.float64)
+    for corner in range(3):
+        np.add.at(sums, welded[faces[:, corner]], face_normals)
+    normals = sums[welded]
+    lengths = np.linalg.norm(normals, axis=1)
+    valid = lengths > 1e-12
+    normals[valid] /= lengths[valid, None]
+    own = np.concatenate([part.normals for part in parts]).astype(np.float64)
+    keep = ~valid | (np.einsum("ij,ij->i", normals, own) <= 0.0)
+    normals[keep] = own[keep]
+    normals = normals.astype(np.float32)
+    return [normals[start:end] for start, end in zip(starts[:-1], starts[1:])]
+
+
+def _smooth_generated_normals(
+    parts: Sequence[MeshPart],
+    generated: Sequence[bool],
+) -> list[MeshPart]:
+    """Smooth generated geom normals across vertex splits, chunks and blocks.
+
+    Geom buffers without normals give each quad its own vertices for its UVs;
+    their baked vertex lighting, and the normals of buffers that have them,
+    are continuous across those splits. Near and far detail are smoothed
+    separately.
+    """
+    result = list(parts)
+    for excluded_kind, target_kinds in (("far", ("near", "any")), ("near", ("far",))):
+        members = [
+            index for index, part in enumerate(parts) if part.lod_kind != excluded_kind
+        ]
+        targets = {
+            index
+            for index in members
+            if generated[index] and parts[index].lod_kind in target_kinds
+        }
+        if not targets:
+            continue
+        smoothed = _position_smoothed_normals([parts[index] for index in members])
+        for index, normals in zip(members, smoothed):
+            if index in targets:
+                result[index] = replace(parts[index], normals=normals)
+    return result
 
 
 def adapt_brake_wall_collision(
@@ -668,6 +784,13 @@ def adapt_fences(
 
     parts: list[MeshPart] = []
     up = np.asarray((0.0, 0.0, 1.0), dtype=np.float32)
+    color_scale = _baked_color_scale(
+        np.asarray(
+            [post.color for fence in fnc.fences for post in fence.posts],
+            dtype=np.float32,
+        ).reshape((-1, 4))
+        / 255.0
+    )
     for fence_index, fence in enumerate(fnc.fences):
         tile_definition = fence_render_definition(fence.tile_type)
         pole_definition = fence_render_definition(fence.pole_type)
@@ -686,12 +809,15 @@ def adapt_fences(
             ],
             dtype=np.float32,
         )
-        colors = np.asarray(
-            [
-                tuple(channel / 255.0 for channel in post.color)
-                for post in fence.posts
-            ],
-            dtype=np.float32,
+        colors = _soften_baked_shade(
+            np.asarray(
+                [
+                    tuple(channel / 255.0 for channel in post.color)
+                    for post in fence.posts
+                ],
+                dtype=np.float32,
+            ),
+            color_scale,
         )
 
         tile_vertices: list[np.ndarray] = []
@@ -1055,8 +1181,11 @@ def adapt_lbs_meshes(lbs: LbsFile) -> AdaptedVisuals:
     registry = _VisualMaterialRegistry()
     parts: list[MeshPart] = []
     warnings: list[str] = []
+    ground_scale = 1.0
 
     if lbs.geom_blocks is not None:
+        geom_parts: list[MeshPart] = []
+        generated_normals: list[bool] = []
         for block_index, block in enumerate(lbs.geom_blocks.blocks):
             for chunk_index, chunk in enumerate(block.render_chunks):
                 buffer = block.buffers[chunk.render_type]
@@ -1096,9 +1225,13 @@ def adapt_lbs_meshes(lbs: LbsFile) -> AdaptedVisuals:
                     }[chunk.distance_class],
                 )
                 if part is not None:
-                    parts.append(part)
+                    geom_parts.append(part)
+                    generated_normals.append("normal" not in (values.dtype.names or ()))
+        ground_scale = _parts_color_scale(geom_parts)
+        parts.extend(_bake_colors(_smooth_generated_normals(geom_parts, generated_normals), ground_scale))
 
     if lbs.object_blocks is not None:
+        object_parts: list[MeshPart] = []
         for group_index, group in enumerate(lbs.object_blocks):
             if group is None:
                 continue
@@ -1119,7 +1252,7 @@ def adapt_lbs_meshes(lbs: LbsFile) -> AdaptedVisuals:
                         lod_kind="near" if has_far_lod else "any",
                     )
                     if part is not None:
-                        parts.append(part)
+                        object_parts.append(part)
                     if has_far_lod:
                         far_part = _make_part(
                             name=name,
@@ -1130,8 +1263,10 @@ def adapt_lbs_meshes(lbs: LbsFile) -> AdaptedVisuals:
                             lod_kind="far",
                         )
                         if far_part is not None:
-                            parts.append(far_part)
+                            object_parts.append(far_part)
+        parts.extend(_bake_colors(object_parts, _parts_color_scale(object_parts)))
 
+    backdrop_parts: list[MeshPart] = []
     for segment_kind in (SUPER_BOWL, REFLECTION_OBJECTS, WATER_OBJECTS):
         for group_index, group in enumerate(lbs.object_data_groups.get(segment_kind, ())):
             source_kind = {
@@ -1152,8 +1287,10 @@ def adapt_lbs_meshes(lbs: LbsFile) -> AdaptedVisuals:
                     ),
                 )
                 if part is not None:
-                    parts.append(part)
+                    backdrop_parts.append(part)
+    parts.extend(_bake_colors(backdrop_parts, ground_scale))
 
+    interactive_parts: list[MeshPart] = []
     for group_index, group in enumerate(
         lbs.object_data_groups.get(INTERACTIVE_OBJECTS, ())
     ):
@@ -1190,7 +1327,8 @@ def adapt_lbs_meshes(lbs: LbsFile) -> AdaptedVisuals:
                     ),
                 )
                 if part is not None:
-                    parts.append(part)
+                    interactive_parts.append(part)
+    parts.extend(_bake_colors(interactive_parts, _parts_color_scale(interactive_parts)))
     for part in parts:
         part.force_color_stream = True
     return AdaptedVisuals(tuple(parts), tuple(registry.specs), tuple(warnings))
