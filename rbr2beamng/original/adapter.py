@@ -792,6 +792,8 @@ def adapt_fences(
         / 255.0
     )
     for fence_index, fence in enumerate(fnc.fences):
+        if not fence.posts:
+            continue
         tile_definition = fence_render_definition(fence.tile_type)
         pole_definition = fence_render_definition(fence.pole_type)
         if tile_definition is None or pole_definition is None:
