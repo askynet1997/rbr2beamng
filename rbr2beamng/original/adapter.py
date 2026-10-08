@@ -5,7 +5,7 @@ import math
 import re
 import shutil
 import warnings
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
@@ -14,6 +14,7 @@ from typing import Callable, Hashable, Iterable, Mapping, Sequence
 import numpy as np
 
 from ..filesystem import current_filesystem
+from ..geometry import is_flat_closed_mesh, thicken_flat_wall
 from ..models import (
     DEFAULT_WATER_NAME_MATCHES,
     DrivelinePoint,
@@ -62,6 +63,7 @@ from .models import (
     ObjectData3D,
     TrkFile,
 )
+from .shape_check import shape_rejection
 from .textures import (
     DEFAULT_ROAD_CONDITION,
     MissingTextureError,
@@ -2244,11 +2246,20 @@ def adapt_trk_shape_collision(
     trk: TrkFile,
     *,
     surfaces: Mapping[int, RbrSurface] | None = None,
+    inflate_thin_walls: bool = True,
 ) -> AdaptedCollision:
+    """Instanced TRK shape collision grouped by surface.
+
+    Templates RBR never collides with are left out. RBR collides with closed
+    zero-thickness shapes, which BeamNG vehicles pass through, so mostly
+    vertical ones become 0.5 m slabs when inflating thin walls.
+    """
     grouped_vertices: dict[int, list[np.ndarray]] = {}
     grouped_faces: dict[int, list[np.ndarray]] = {}
     grouped_counts: dict[int, int] = {}
     warnings: list[str] = []
+    rejected: Counter[str] = Counter()
+    rejected_instances = 0
     for mesh in trk.shape_collision_meshes or ():
         if mesh.faces and mesh.vertices:
             local_vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -2263,7 +2274,13 @@ def adapt_trk_shape_collision(
                 f"Original shape collision {mesh.name!r} has no instances"
             )
             continue
+        reason = shape_rejection(mesh)
+        if reason is not None:
+            rejected[reason] += 1
+            rejected_instances += len(mesh.instances)
+            continue
         material_id = int(mesh.material_id)
+        flat = inflate_thin_walls and is_flat_closed_mesh(local_vertices, local_faces)
         for instance in mesh.instances:
             scale = np.asarray(instance.scale, dtype=np.float64)
             rotation = _quaternion_matrix(instance.rotation)
@@ -2271,14 +2288,24 @@ def adapt_trk_shape_collision(
                 np.asarray(local_vertices, dtype=np.float64)
                 * scale
             ) @ rotation.T + np.asarray(instance.position, dtype=np.float64)
-            vertices = vertices.astype(np.float32)
             faces = local_faces
             if np.linalg.det(rotation) * float(np.prod(scale)) < 0:
                 faces = faces[:, (0, 2, 1)]
+            if flat:
+                slab = thicken_flat_wall(vertices, faces)
+                if slab is not None:
+                    vertices, faces = slab
+            vertices = vertices.astype(np.float32)
             base = grouped_counts.get(material_id, 0)
             grouped_vertices.setdefault(material_id, []).append(vertices)
             grouped_faces.setdefault(material_id, []).append(faces + base)
             grouped_counts[material_id] = base + len(vertices)
+    if rejected:
+        warnings.append(
+            f"Left out {sum(rejected.values())} Original shape collision templates "
+            f"({rejected_instances} instances) that RBR never collides with: "
+            + ", ".join(f"{count} {reason}" for reason, count in sorted(rejected.items()))
+        )
 
     parts, surface_ids = _finalize_collision_parts(
         grouped_vertices,
@@ -2433,6 +2460,23 @@ def extract_referenced_textures(
 
 
 _SurfacePhysics = tuple[str, bool, bool, bool, float, bool]
+
+# RBR caps each of up to eight car contacts with a +BENDABLE surface at its
+# eHigh, so the object gives way. A BeamNG fluid volume resisting like four
+# engaged contacts lets cars push through only while that stays below a rally
+# car's traction (about 10 kN); stiffer bendables would trap them, so they
+# stay solid.
+_BENDABLE_CONTACTS = 4
+_SOFT_BENDABLE_MAX_CAP = 2500.0
+_SOFT_GROUND_DEPTH = 1.0
+
+
+def soft_bendable_resistance(surface: RbrSurface | None) -> float:
+    """BeamNG resisting force for shape collision on a weak bendable surface, else 0."""
+    if surface is None or "+BENDABLE" not in surface.flags:
+        return 0.0
+    cap = surface.coefficients.get("eHigh", 0.0)
+    return _BENDABLE_CONTACTS * cap if 0.0 < cap <= _SOFT_BENDABLE_MAX_CAP else 0.0
 
 
 def _surface_physics(
@@ -2813,6 +2857,100 @@ def _combined_bounds(
     return tuple(float(value) for value in lower), tuple(float(value) for value in upper)
 
 
+# RBR pushes the car out of a TRK soft volume with 2,500 N per metre of
+# penetration, capped at 5 kN, plus a drag of up to 500 N, whatever its
+# material. A passable BeamNG soft volume resists about half that peak.
+SOFT_VOLUME_RESISTANCE = 2750.0
+_BOX_CORNERS = np.asarray(
+    [(x, y, z) for z in (-1, 1) for y in (-1, 1) for x in (-1, 1)],
+    dtype=np.float64,
+)
+_BOX_FACES = np.asarray(
+    (
+        (0, 2, 1), (1, 2, 3), (4, 5, 6), (5, 7, 6), (0, 1, 4), (1, 5, 4),
+        (2, 6, 3), (3, 6, 7), (0, 4, 2), (2, 4, 6), (1, 3, 5), (3, 7, 5),
+    ),
+    dtype=np.uint32,
+)
+_GOLDEN = (1.0 + math.sqrt(5.0)) / 2.0
+_ICOSAHEDRON_VERTICES = np.asarray(
+    (
+        (-1, _GOLDEN, 0), (1, _GOLDEN, 0), (-1, -_GOLDEN, 0), (1, -_GOLDEN, 0),
+        (0, -1, _GOLDEN), (0, 1, _GOLDEN), (0, -1, -_GOLDEN), (0, 1, -_GOLDEN),
+        (_GOLDEN, 0, -1), (_GOLDEN, 0, 1), (-_GOLDEN, 0, -1), (-_GOLDEN, 0, 1),
+    ),
+    dtype=np.float64,
+) / math.sqrt(1.0 + _GOLDEN * _GOLDEN)
+_ICOSAHEDRON_FACES = np.asarray(
+    (
+        (0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11),
+        (1, 5, 9), (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
+        (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
+        (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1),
+    ),
+    dtype=np.uint32,
+)
+
+
+def adapt_trk_soft_volumes(
+    trk: TrkFile,
+    *,
+    excluded_surface_ids: frozenset[int] = frozenset(),
+) -> MeshPart | None:
+    """Every TRK soft-volume box and sphere as one closed collision part."""
+    all_vertices: list[np.ndarray] = []
+    all_faces: list[np.ndarray] = []
+    count = 0
+    for mesh in trk.shape_collision_meshes or ():
+        volume = mesh.soft_volume
+        if volume is None or int(mesh.material_id) in excluded_surface_ids:
+            continue
+        center = np.asarray(volume.center, dtype=np.float64)
+        if volume.kind == 1 and isinstance(volume.size_or_radius, tuple):
+            local = center + _BOX_CORNERS * np.abs(np.asarray(volume.size_or_radius, dtype=np.float64))
+            local_faces = _BOX_FACES
+        elif volume.kind == 2 and not isinstance(volume.size_or_radius, tuple):
+            local = center + _ICOSAHEDRON_VERTICES * float(volume.size_or_radius)
+            local_faces = _ICOSAHEDRON_FACES
+        else:
+            continue
+        if np.ptp(local, axis=0).min() <= 0.0:
+            continue
+        for instance in mesh.instances:
+            scale = np.asarray(instance.scale, dtype=np.float64)
+            rotation = (
+                np.identity(3, dtype=np.float64)
+                if mesh.use_local_rotation
+                else _quaternion_matrix(instance.rotation)
+            )
+            faces = local_faces
+            if np.linalg.det(rotation) * float(np.prod(scale)) < 0:
+                faces = faces[:, (0, 2, 1)]
+            all_vertices.append(
+                (local * scale) @ rotation.T + np.asarray(instance.position, dtype=np.float64)
+            )
+            all_faces.append(faces + count)
+            count += len(local)
+    if not all_vertices:
+        return None
+    vertices = np.concatenate(all_vertices).astype(np.float32)
+    faces = np.concatenate(all_faces).astype(np.uint32)
+    texcoords = np.zeros((len(vertices), 2), dtype=np.float32)
+    return MeshPart(
+        name="original_soft_volume_collision",
+        vertices=vertices,
+        faces=faces,
+        normals=_generated_normals(vertices, faces),
+        texcoords=texcoords,
+        colors=np.ones((len(vertices), 4), dtype=np.float32),
+        material_index=0,
+        material_name="original_soft_volume",
+        collision_eligible=True,
+        water=False,
+        texcoord_sets=(texcoords,),
+    )
+
+
 def adapt_visual_snowbank_collision(
     visuals: AdaptedVisuals,
     trk: TrkFile,
@@ -2956,6 +3094,7 @@ def prepare_original_variant(
     fnc: FncFile | None = None,
     fence_texture_paths: Mapping[int, Path] | None = None,
     use_snowwall_collision_override: bool = True,
+    inflate_thin_walls: bool = True,
     water_name_matches: tuple[str, ...] | None = DEFAULT_WATER_NAME_MATCHES,
     location: StageLocation | None = None,
     source_variant: str = "",
@@ -3069,6 +3208,7 @@ def prepare_original_variant(
         shape_collision = adapt_trk_shape_collision(
             trk,
             surfaces=surfaces,
+            inflate_thin_walls=inflate_thin_walls,
         )
         trk_span.update(
             parts=len(shape_collision.parts),
@@ -3116,7 +3256,22 @@ def prepare_original_variant(
         if unresolved_surface_ids
         else []
     )
+    soft_volume_part = adapt_trk_soft_volumes(
+        trk,
+        excluded_surface_ids=(
+            frozenset(
+                surface_id
+                for surface_id, surface in surfaces.items()
+                if surface.profile is not None
+                and surface.profile.ground_type == "SNOWBANK"
+            )
+            if use_snowwall_collision_override
+            else frozenset()
+        ),
+    )
     collision_parts = [*collision.parts, *shape_collision.parts]
+    if soft_volume_part is not None:
+        collision_parts.append(soft_volume_part)
     if snowbank_visual_collision:
         visual_snowwall_material_index = (
             len(visuals.material_specs) + len(collision_surface_ids)
@@ -3174,7 +3329,46 @@ def prepare_original_variant(
     for part in collision.parts:
         part.material_index = variants[part.material_name].material.index
     for part, surface_id in zip(shape_collision.parts, shape_collision.surface_ids):
-        part.material_index = variants[f"original_surface_{surface_id:03d}"].material.index
+        name = f"original_surface_{surface_id:03d}"
+        resistance = soft_bendable_resistance(surfaces.get(surface_id))
+        if resistance:
+            source = variants[name]
+            name = f"{name}_soft"
+            material = replace(source.material, index=len(rbr_materials), name=name)
+            rbr_materials.append(material)
+            variants[name] = replace(
+                source,
+                material=material,
+                ground_type=f"RBR_SOFT_{round(resistance)}",
+                ground_depth=_SOFT_GROUND_DEPTH,
+                soft_resistance=resistance,
+            )
+            part.material_name = name
+        part.material_index = variants[name].material.index
+    if soft_volume_part is not None:
+        soft_volume_material = RbrMaterial(
+            index=len(rbr_materials),
+            name="original_soft_volume",
+            effect="RBR_Original_Physics",
+            technique="Default",
+            diffuse_texture=None,
+            second_diffuse_texture=None,
+            normal_texture=None,
+            specular_texture=None,
+            properties={"originalSourceKind": "softVolume"},
+        )
+        rbr_materials.append(soft_volume_material)
+        soft_volume_part.material_index = soft_volume_material.index
+        variants["original_soft_volume"] = MaterialVariant(
+            material=soft_volume_material,
+            ground_type=f"RBR_SOFT_{round(SOFT_VOLUME_RESISTANCE)}",
+            hard=False,
+            water=False,
+            bendable=False,
+            source_surface_ids=(),
+            ground_depth=_SOFT_GROUND_DEPTH,
+            soft_resistance=SOFT_VOLUME_RESISTANCE,
+        )
     if snowbank_visual_collision:
         variants["original_visual_snowwall"] = MaterialVariant(
             material=None,

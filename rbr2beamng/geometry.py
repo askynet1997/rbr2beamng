@@ -341,6 +341,79 @@ def thicken_rbr_col_box_dimensions(
     return float(width), float(height), float(depth)
 
 
+def _directed_edges(faces: np.ndarray) -> list[tuple[int, int]]:
+    return [
+        tuple(edge)
+        for edge in np.asarray(faces)[:, (0, 1, 1, 2, 2, 0)].reshape((-1, 2)).tolist()
+    ]
+
+
+def is_flat_closed_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    maximum_thickness: float = 0.005,
+) -> bool:
+    """Whether a consistently wound closed mesh lies in one plane."""
+    edges = _directed_edges(faces)
+    directed = set(edges)
+    if len(directed) != len(edges) or any(
+        (second, first) not in directed for first, second in edges
+    ):
+        return False
+    points = np.asarray(vertices, dtype=np.float64)
+    centred = points - points.mean(axis=0)
+    normal = np.linalg.svd(centred, full_matrices=False)[2][-1]
+    return float(np.ptp(centred @ normal)) < maximum_thickness
+
+
+def thicken_flat_wall(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    target_thickness: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """A closed slab centred on a flat closed mostly vertical mesh, or None if it is not vertical.
+
+    Faces facing each side of the plane move half the thickness outward and
+    the rim edges they share gain side faces.
+    """
+    points = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces)
+    normals = np.cross(
+        points[faces[:, 1]] - points[faces[:, 0]],
+        points[faces[:, 2]] - points[faces[:, 0]],
+    )
+    reference = normals[np.argmax(np.einsum("ij,ij->i", normals, normals))]
+    length = float(np.linalg.norm(reference))
+    if length == 0.0 or abs(float(reference[2])) > 0.65 * length:
+        return None
+    reference = reference / length
+    back = normals @ reference < 0.0
+    back_edges = set(_directed_edges(faces[back]))
+    count = len(points)
+    sides = [
+        face
+        for first, second in _directed_edges(faces[~back])
+        if (second, first) in back_edges
+        for face in (
+            (second, first, first + count),
+            (second, first + count, second + count),
+        )
+    ]
+    offset = reference * (target_thickness * 0.5)
+    return (
+        np.concatenate((points + offset, points - offset)),
+        np.concatenate(
+            (
+                faces[~back],
+                faces[back] + count,
+                np.asarray(sides, dtype=faces.dtype).reshape((-1, 3)),
+            )
+        ),
+    )
+
+
 def spawn_rotation(
     direction: Iterable[float],
     map_yaw_degrees: float = 0.0,
@@ -2231,102 +2304,90 @@ def _inflate_part_thin_walls(
     world_vertices: np.ndarray,
     names: Sequence[str],
 ) -> list[MeshPart | None]:
-    """Inflate the thin walls of one part, with one route query per step."""
+    """Inflate the thin walls of one part, with one route query.
+
+    The inner face of each pair is the one on the route's side of the wall,
+    judged along the wall normal because paired triangles can be offset along
+    the wall by more than the wall is thick.
+    """
     source_faces = np.asarray(templates[0].part.faces, dtype=np.uint32)
     pair_faces = [
         np.asarray(template.shell.face_pairs, dtype=np.int64)
         for template in templates
     ]
+    pair_centroids = [
+        np.mean(world_vertices[source_faces[faces]], axis=2)
+        for faces in pair_faces
+    ]
     pair_queries = _route_queries(
-        [
-            np.mean(world_vertices[source_faces[faces.reshape(-1)]], axis=1)
-            for faces in pair_faces
-        ],
+        [np.mean(centroids, axis=1) for centroids in pair_centroids],
         route_positions,
     )
-    inner_triangles: list[np.ndarray] = []
-    for faces, (_nearest, pair_distances) in zip(pair_faces, pair_queries):
-        pair_distances = pair_distances.reshape((-1, 2))
-        inner_indices = np.where(
-            pair_distances[:, 0] <= pair_distances[:, 1],
-            faces[:, 0],
-            faces[:, 1],
-        )
-        inner_indices = np.unique(inner_indices)
-        inner_triangles.append(world_vertices[source_faces[inner_indices]].copy())
-    inner_centroids = [np.mean(triangles, axis=1) for triangles in inner_triangles]
-    centroid_queries = _route_queries(inner_centroids, route_positions)
-    welded: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-    for triangles, centroids, (nearest_centroids, _distances) in zip(
-        inner_triangles,
-        inner_centroids,
-        centroid_queries,
+    repairs: list[MeshPart | None] = []
+    for faces, centroids, (nearest, _distances), name in zip(
+        pair_faces,
+        pair_centroids,
+        pair_queries,
+        names,
     ):
-        roadward = nearest_centroids - centroids
-        roadward[:, 2] = 0.0
+        first = world_vertices[source_faces[faces[:, 0]]]
+        wall_normals = np.cross(first[:, 1] - first[:, 0], first[:, 2] - first[:, 0])
+        route_offsets = nearest - np.mean(centroids, axis=1)
+        route_offsets[:, 2] = 0.0
+        route_sides = np.einsum("ij,ij->i", route_offsets, wall_normals)
+        first_sides = np.einsum("ij,ij->i", centroids[:, 0] - centroids[:, 1], wall_normals)
+        inner_indices, first_pairs = np.unique(
+            np.where(first_sides * route_sides >= 0, faces[:, 0], faces[:, 1]),
+            return_index=True,
+        )
+        triangles = world_vertices[source_faces[inner_indices]].copy()
         raw_normals = np.cross(
             triangles[:, 1] - triangles[:, 0],
             triangles[:, 2] - triangles[:, 0],
         )
-        reverse = np.einsum("ij,ij->i", raw_normals, roadward) < 0
-        triangles[reverse] = triangles[reverse][:, (0, 2, 1)]
+        away_from_route = np.einsum(
+            "ij,ij->i",
+            raw_normals,
+            np.sign(route_sides)[first_pairs, None] * wall_normals[first_pairs],
+        ) < 0
+        triangles[away_from_route] = triangles[away_from_route][:, (0, 2, 1)]
         inner_vertices, inverse = np.unique(
             triangles.reshape((-1, 3)).astype(np.float32),
             axis=0,
             return_inverse=True,
         )
-        welded.append(
-            (
+        repairs.append(
+            _inflated_thin_wall(
+                templates[0].part,
                 inner_vertices,
                 inverse.reshape((-1, 3)).astype(np.uint32),
-                np.mean(inner_vertices, axis=0, keepdims=True),
+                name,
             )
         )
-    vertex_queries = _route_queries(
-        [np.concatenate((vertices, center)) for vertices, _faces, center in welded],
-        route_positions,
-    )
-    return [
-        _inflated_thin_wall(
-            templates[0].part,
-            inner_vertices,
-            inner_faces,
-            nearest[:-1],
-            component_center,
-            nearest[-1:],
-            name,
-        )
-        for (inner_vertices, inner_faces, component_center), (nearest, _distances), name in zip(
-            welded,
-            vertex_queries,
-            names,
-        )
-    ]
+    return repairs
 
 
 def _inflated_thin_wall(
     part: MeshPart,
     inner_vertices: np.ndarray,
     inner_faces: np.ndarray,
-    nearest_vertices: np.ndarray,
-    component_center: np.ndarray,
-    center_nearest: np.ndarray,
     name: str,
 ) -> MeshPart | None:
-    outward = inner_vertices.astype(np.float64) - nearest_vertices
-    outward[:, 2] = 0.0
-    lengths = np.linalg.norm(outward, axis=1)
-    fallback = component_center[0] - center_nearest[0]
-    fallback[2] = 0.0
-    fallback_length = float(np.linalg.norm(fallback))
-    if fallback_length < 1e-8:
+    """Close the inner faces, whose normals face the route side, into a shell
+    reaching 0.5 m behind them."""
+    points = inner_vertices.astype(np.float64)
+    normals = np.cross(
+        points[inner_faces[:, 1]] - points[inner_faces[:, 0]],
+        points[inner_faces[:, 2]] - points[inner_faces[:, 0]],
+    )
+    inward = np.zeros_like(points)
+    for corner in range(3):
+        np.add.at(inward, inner_faces[:, corner], -normals)
+    lengths = np.linalg.norm(inward, axis=1)
+    if np.any(lengths < 1e-12):
         return None
-    fallback /= fallback_length
-    invalid = lengths < 1e-8
-    outward[~invalid] /= lengths[~invalid, None]
-    outward[invalid] = fallback
     outer_vertices = (
-        inner_vertices.astype(np.float64) + outward * _THIN_WALL_THICKNESS
+        points + inward / lengths[:, None] * _THIN_WALL_THICKNESS
     ).astype(np.float32)
     outer_offset = len(inner_vertices)
     outer_faces = inner_faces[:, (0, 2, 1)] + outer_offset

@@ -1278,6 +1278,39 @@ def write_materials(
         "version": 1.5,
     }
     write_json(level_dir / "art" / "shapes" / "main.materials.json", output)
+    soft_ground_models = {
+        variant.ground_type: _soft_ground_model(variant.soft_resistance)
+        for variant in materials.values()
+        if variant.soft_resistance > 0
+    }
+    if soft_ground_models:
+        write_json(level_dir / "groundModels" / "rbr_soft.json", soft_ground_models)
+
+
+# A Sunburst (1.4 t) coasting through a 4 m deep test volume met a mean resisting
+# force of about 3.15 N per unit of flowConsistencyIndex at flowBehaviorIndex 0.2,
+# nearly independent of speed between 7 and 23 m/s. With groundDepth 0 the same
+# ground model is solid.
+_SOFT_FORCE_PER_CONSISTENCY = 3.15
+
+
+def _soft_ground_model(resistance: float) -> dict[str, object]:
+    return {
+        "staticFrictionCoefficient": 0.6,
+        "slidingFrictionCoefficient": 0.6,
+        "hydrodynamicFriction": 0,
+        "stribeckVelocity": 6,
+        "strength": 1,
+        "roughnessCoefficient": 0,
+        "fluidDensity": 0,
+        "flowConsistencyIndex": round(resistance / _SOFT_FORCE_PER_CONSISTENCY, 1),
+        "flowBehaviorIndex": 0.2,
+        "dragAnisotropy": 1,
+        "shearStrength": 0,
+        "defaultDepth": 0,
+        "collisiontype": "FOLIAGE",
+        "skidMarks": False,
+    }
 
 
 def _sim_group(name: str, parent: str, level_id: str) -> dict[str, object]:

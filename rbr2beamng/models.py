@@ -206,6 +206,7 @@ class MaterialVariant:
     base_vertex_color: bool = False
     classification_fallback: str | None = None
     opacity_depth_prepass: bool = False
+    soft_resistance: float = 0.0
 
 
 @dataclass(frozen=True)

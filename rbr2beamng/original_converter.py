@@ -1009,6 +1009,7 @@ def _prepare(
     location,
     texture_target: Path,
     use_snowwall_collision_override: bool,
+    inflate_thin_walls: bool,
     water_name_matches,
     parsed_cache: dict[tuple[object, Path], object],
     resolver_cache: dict[Path, TextureResolver],
@@ -1107,6 +1108,7 @@ def _prepare(
                 fnc=fnc,
                 fence_texture_paths=fence_texture_paths,
                 use_snowwall_collision_override=use_snowwall_collision_override,
+                inflate_thin_walls=inflate_thin_walls,
                 water_name_matches=water_name_matches,
                 location=location,
                 source_variant=files.tint.value,
@@ -1335,6 +1337,7 @@ def _convert_original(
                         stage_location,
                         temporary_root / "original_textures" / tint,
                         options.use_snowwall_collision_override,
+                        options.inflate_thin_walls,
                         (
                             options.water_name_matches
                             if options.use_water_name_fallback

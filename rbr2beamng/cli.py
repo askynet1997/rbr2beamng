@@ -314,7 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-thin-wall-inflation",
         dest="inflate_thin_walls",
         action="store_false",
-        help="Keep Original RBR thin paired collision walls instead of inflating them outward",
+        help="Keep Original RBR thin paired collision walls and flat shape panels instead of thickening them",
     )
     convert_parser.add_argument(
         "--no-visual-lods",

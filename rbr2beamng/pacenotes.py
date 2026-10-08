@@ -56,7 +56,6 @@ START_NOTE_ID = _legacy_note_id("start")
 FINISH_NOTE_ID = _legacy_note_id("finish")
 SPLIT_NOTE_ID = _legacy_note_id("split")
 STOP_CONTROL_NOTE_ID = _legacy_note_id("stopControl")
-UNMAPPED_NOTE_ID = _legacy_note_id("unmapped")
 TIMING_NOTE_IDS = frozenset(
     {
         START_NOTE_ID,
@@ -1817,7 +1816,7 @@ def unsupported_pacenote_conversions(
         )
         for note_id, definition in sorted(LEGACY_DEFINITIONS.items())
         if not definition.spoken
-        and note_id == UNMAPPED_NOTE_ID
+        and note_id in LEGACY_UNSUPPORTED_PRESENTATIONS
     ]
     if rbr_root is None:
         return tuple(rows)

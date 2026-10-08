@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 4,
   "profiles": {
     "void": {"groundType": "VOID", "hard": false, "bendable": false, "water": false, "collisionEligible": false, "sourceNames": ["Spectator"]},
     "gravel": {"groundType": "GRAVEL", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "sourceNames": ["Undefined", "Gravel_Fine_Shallow_Dry", "Gravel_Medium_Shallow_Dry", "Gravel_Coarse_Shallow_Dry", "Rough_VeryRough_Dry", "Gravel_Fine_Shallow_Dry_Clone", "US2_Gravel_Fine_Shallow_Dry", "BR2_Gravel_Coarse_Shallow_Dry"]},
@@ -28,13 +28,11 @@
     "mudShallow": {"groundType": "MUD", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "groundDepth": 0.02, "sourceNames": ["Rough_Rough_Wet", "Dirt_Hard_Wet", "Dirt_Hard_Wet_Clone"]},
     "mud": {"groundType": "MUD", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "groundDepth": 0.05, "sourceNames": ["Dirt_Medium_Wet"]},
     "mudDeep": {"groundType": "MUD", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "groundDepth": 0.1, "sourceNames": ["Dirt_Soft_Wet"]},
-    "wood": {"groundType": "WOOD", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "sourceNames": ["Tree_Small", "Tree_Medium", "Tree_Large", "Trunk_Small", "Trunk_Medium", "Trunk_Large", "Tree_Stump"]},
+    "wood": {"groundType": "WOOD", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "sourceNames": ["Tree_Small", "Tree_Medium", "Tree_Large", "Trunk_Small", "Trunk_Medium", "Trunk_Large", "Tree_Stump", "Spret_Bush_Small", "Spret_Bush_Medium", "Spret_Bush_Large", "Lov_Bush_Small", "Lov_Bush_Medium", "Lov_Bush_Large"]},
     "rock": {"groundType": "ROCK", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "sourceNames": ["Rock_Small", "Rock_Medium", "Rock_Large"]},
     "metal": {"groundType": "METAL", "hard": true, "bendable": false, "water": false, "collisionEligible": true, "sourceNames": ["Metal_Pole", "Metal_Barrier"]},
-    "branches": {"groundType": "BRANCHES_STRONG", "hard": true, "bendable": true, "water": false, "collisionEligible": true, "sourceNames": ["Spret_Bush_Large", "Lov_Bush_Large", "Bendable_Tree"]},
-    "leavesThin": {"groundType": "LEAVES_THIN", "hard": false, "bendable": false, "water": false, "collisionEligible": false, "sourceNames": ["Spret_Bush_Small", "Lov_Bush_Small", "Very_Sparse_Bush"]},
-    "leavesStrong": {"groundType": "LEAVES_STRONG", "hard": false, "bendable": false, "water": false, "collisionEligible": false, "sourceNames": ["Spret_Bush_Medium", "Lov_Bush_Medium", "Sparse_Bush"]},
-    "bushBranches": {"groundType": "BRANCHES_STRONG", "hard": false, "bendable": false, "water": false, "collisionEligible": true, "sourceNames": ["Dense_Bush", "Very_Dense_Bush"]},
+    "branches": {"groundType": "BRANCHES_STRONG", "hard": true, "bendable": true, "water": false, "collisionEligible": true, "sourceNames": ["Bendable_Tree"]},
+    "bushBranches": {"groundType": "BRANCHES_STRONG", "hard": false, "bendable": false, "water": false, "collisionEligible": true, "sourceNames": ["Very_Sparse_Bush", "Sparse_Bush", "Dense_Bush", "Very_Dense_Bush"]},
     "water": {"groundType": "WATER", "hard": false, "bendable": false, "water": true, "collisionEligible": false, "sourceNames": ["Water_Surface"]},
     "softCollision": {"groundType": "SOFT_COLLISION_GENERAL", "hard": true, "bendable": true, "water": false, "collisionEligible": true, "sourceNames": ["Bendable_01_NGP", "Bendable_02_NGP", "Bendable_03_NGP", "Bendable_04_NGP", "Bendable_05_NGP", "Bendable_06_NGP", "Bendable_07_NGP", "Bendable_08_NGP", "Bendable_09_NGP", "Bendable_10_NGP", "Bendable_11_NGP", "Bendable_12_NGP", "Bendable_13_NGP", "Bendable_14_NGP", "Bendable_15_NGP"]}
   }

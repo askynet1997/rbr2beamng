@@ -57,7 +57,7 @@
     {"id": 25, "name": "flat right", "direction": 1, "descriptor": "flat", "nominalLength": 120},
     {"id": 26, "name": "flat left", "direction": -1, "descriptor": "flat", "nominalLength": 120},
     {"id": 27, "name": "bridge", "modifier": "overBridge"},
-    {"id": 28, "name": "go straight", "spoken": false, "role": "unmapped", "presentation": {"category": "Unsupported", "entry": "no corresponding BeamNG entry", "documentation": "Preserved as an unspoken source record; no BeamNG equivalent"}},
+    {"id": 28, "name": "go straight", "modifier": "pastJunction"},
     {"id": 29, "name": "keep right", "modifier": "keepRight"},
     {"id": 30, "name": "keep left", "modifier": "keepLeft"},
     {"id": 31, "name": "keep middle", "modifier": "keepMiddle"},
