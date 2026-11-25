@@ -17,6 +17,7 @@ from .geometry import remap_mesh_part
 from .models import MeshPart, PbrMaterialOverride, RbrMaterial
 from .profiling import profile_span
 from .rbr import texture_has_alpha
+from .texture_cooker import save_cooker_png
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ _EFFECT_LAYOUTS = {
 }
 _CHUNKED_RASTER_PIXELS = 16_384
 _RASTER_CHUNK_PIXELS = 32_768
+_QUANTIZE_CHUNK_VALUES = 65_536
 _ORIGINAL_RBR_LEGACY_SPECULAR_CLEAR_COAT_ROUGHNESS = 0.5
 
 
@@ -224,31 +226,46 @@ def _wrap(values: np.ndarray, size: int) -> None:
         values &= size - 1
 
 
+def _fill_columns(target: np.ndarray, values: np.ndarray) -> np.ndarray:
+    # Multiplying (N, C) by a contiguous (N, C) copy is far faster than by an
+    # (N, 1) broadcast, which numpy loops C elements at a time.
+    for channel in range(target.shape[1]):
+        target[:, channel] = values
+    return target
+
+
+def _repeat_columns(values: np.ndarray, channels: int) -> np.ndarray:
+    return _fill_columns(np.empty((len(values), channels), dtype=values.dtype), values)
+
+
 def _sample(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
     height, width, channels = image.shape
-    one = np.float32(1.0)
     u = uv[:, 0]
     v = uv[:, 1]
-    x = (
-        (u - np.floor(u)) * np.float32(width)
-        - np.float32(0.5)
-    )
-    y = (
-        (one - (v - np.floor(v))) * np.float32(height)
-        - np.float32(0.5)
-    )
+    x = np.floor(u)
+    np.subtract(u, x, out=x)
+    x *= np.float32(width)
+    x -= np.float32(0.5)
+    y = np.floor(v)
+    np.subtract(v, y, out=y)
+    np.subtract(np.float32(1.0), y, out=y)
+    y *= np.float32(height)
+    y -= np.float32(0.5)
     floor_x = np.floor(x)
     floor_y = np.floor(y)
+    x -= floor_x
+    y -= floor_y
+    factor = _repeat_columns(x, channels)
     x0 = floor_x.astype(np.int64)
     y0 = floor_y.astype(np.int64)
-    fx = (x - floor_x)[:, None]
-    fy = (y - floor_y)[:, None]
     x1 = x0 + 1
     y1 = y0 + 1
     _wrap(x0, width)
     _wrap(x1, width)
     _wrap(y0, height)
     _wrap(y1, height)
+    y0 *= width
+    y1 *= width
     texels = image.reshape((-1, channels)).view(
         np.dtype((np.void, channels * image.itemsize))
     ).ravel()
@@ -256,23 +273,33 @@ def _sample(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
     def texel(index: np.ndarray) -> np.ndarray:
         return texels[index].view(image.dtype).reshape((-1, channels))
 
-    row0 = y0 * width
-    row1 = y1 * width
-    top = texel(row0 + x0)
-    top += (texel(row0 + x1) - top) * fx
-    bottom = texel(row1 + x0)
-    bottom += (texel(row1 + x1) - bottom) * fx
-    top += (bottom - top) * fy
+    top = texel(y0 + x0)
+    step = texel(y0 + x1)
+    step -= top
+    step *= factor
+    top += step
+    bottom = texel(y1 + x0)
+    step = texel(y1 + x1)
+    step -= bottom
+    step *= factor
+    bottom += step
+    bottom -= top
+    bottom *= _fill_columns(factor, y)
+    top += bottom
     top /= np.float32(255.0)
     return top
 
 
+# The sRGB curves raise to a power as exp(log(x) * exponent), about twice as
+# fast as np.power on float32 but off from it by a float32 rounding at times.
 def _srgb_to_linear(values: np.ndarray) -> np.ndarray:
+    values = np.ascontiguousarray(values)
     low = values <= 0.04045
-    result = values.copy()
-    np.add(result, 0.055, out=result)
+    result = np.add(values, 0.055)
     np.divide(result, 1.055, out=result)
-    np.power(result, 2.4, out=result)
+    np.log(result, out=result)
+    np.multiply(result, 2.4, out=result)
+    np.exp(result, out=result)
     np.divide(
         values,
         12.92,
@@ -285,7 +312,10 @@ def _srgb_to_linear(values: np.ndarray) -> np.ndarray:
 def _linear_to_srgb(values: np.ndarray) -> np.ndarray:
     low = values <= 0.0031308
     result = np.maximum(values, 0.0)
-    np.power(result, 1.0 / 2.4, out=result)
+    with np.errstate(divide="ignore"):
+        np.log(result, out=result)
+    np.multiply(result, 1.0 / 2.4, out=result)
+    np.exp(result, out=result)
     np.multiply(result, 1.055, out=result)
     np.subtract(result, 0.055, out=result)
     np.multiply(
@@ -295,6 +325,114 @@ def _linear_to_srgb(values: np.ndarray) -> np.ndarray:
         where=low,
     )
     return result
+
+
+@dataclass(frozen=True)
+class _RasterBlock:
+    """Covered pixels of one triangle within a block of rows.
+
+    ``inside`` spans rows ``start_y:`` and columns ``start_x:``; ``barycentric``
+    holds one row per covered pixel in row-major order.
+    """
+
+    start_y: int
+    start_x: int
+    inside: np.ndarray
+    barycentric: np.ndarray
+
+    def flat_indices(self, width: int) -> np.ndarray:
+        """Covered pixels as indices into a row-major image ``width`` pixels wide."""
+        rows, columns = self.inside.shape
+        row_starts = np.arange(self.start_y, self.start_y + rows) * width
+        return (
+            row_starts[:, None]
+            + np.arange(self.start_x, self.start_x + columns)
+        )[self.inside]
+
+
+def _triangle_raster_blocks(
+    face: np.ndarray,
+    uv: np.ndarray,
+    width: int,
+    height: int,
+) -> Iterator[tuple[np.ndarray, bool, _RasterBlock | None]]:
+    triangle = np.column_stack(
+        (
+            uv[face, 0] * width,
+            (1.0 - uv[face, 1]) * height,
+        )
+    )
+    minimum = np.maximum(0, np.floor(triangle.min(axis=0)).astype(int))
+    maximum = np.minimum(
+        (width - 1, height - 1),
+        np.ceil(triangle.max(axis=0)).astype(int),
+    )
+    if np.any(maximum < minimum):
+        yield triangle, False, None
+        return
+
+    first = triangle[1] - triangle[0]
+    second = triangle[2] - triangle[0]
+    denominator = first[0] * second[1] - first[1] * second[0]
+    if abs(float(denominator)) <= 1e-10:
+        yield triangle, True, None
+        return
+
+    xs = np.arange(minimum[0], maximum[0] + 1)
+    row_count = int(maximum[1] - minimum[1] + 1)
+    rows_per_chunk = row_count
+    if len(xs) * row_count >= _CHUNKED_RASTER_PIXELS:
+        rows_per_chunk = max(
+            1,
+            _RASTER_CHUNK_PIXELS // max(1, len(xs)),
+        )
+    relative_x = xs + 0.5 - triangle[0, 0]
+    column_weight1 = relative_x * second[1]
+    column_weight2 = first[1] * relative_x
+    sampled = False
+    for start_y in range(
+        int(minimum[1]),
+        int(maximum[1]) + 1,
+        rows_per_chunk,
+    ):
+        ys = np.arange(
+            start_y,
+            min(int(maximum[1]) + 1, start_y + rows_per_chunk),
+        )
+        relative_y = ys + 0.5 - triangle[0, 1]
+        weight1 = column_weight1 - (relative_y * second[0])[:, None]
+        weight1 /= denominator
+        weight2 = (first[0] * relative_y)[:, None] - column_weight2
+        weight2 /= denominator
+        weight0 = 1.0 - weight1
+        weight0 -= weight2
+        weight0 = weight0.astype(np.float32)
+        weight1 = weight1.astype(np.float32)
+        weight2 = weight2.astype(np.float32)
+        inside = weight0 >= -1e-5
+        inside &= weight1 >= -1e-5
+        inside &= weight2 >= -1e-5
+        if not np.any(inside):
+            continue
+        sampled = True
+        yield (
+            triangle,
+            True,
+            _RasterBlock(
+                start_y,
+                int(xs[0]),
+                inside,
+                np.column_stack(
+                    (
+                        weight0[inside],
+                        weight1[inside],
+                        weight2[inside],
+                    )
+                ),
+            ),
+        )
+    if not sampled:
+        yield triangle, True, None
 
 
 def _triangle_raster_samples(
@@ -311,82 +449,48 @@ def _triangle_raster_samples(
         np.ndarray | None,
     ]
 ]:
-    triangle = np.column_stack(
-        (
-            uv[face, 0] * width,
-            (1.0 - uv[face, 1]) * height,
-        )
-    )
-    minimum = np.maximum(0, np.floor(triangle.min(axis=0)).astype(int))
-    maximum = np.minimum(
-        (width - 1, height - 1),
-        np.ceil(triangle.max(axis=0)).astype(int),
-    )
-    if np.any(maximum < minimum):
-        yield triangle, False, None, None, None
-        return
-
-    first = triangle[1] - triangle[0]
-    second = triangle[2] - triangle[0]
-    denominator = first[0] * second[1] - first[1] * second[0]
-    if abs(float(denominator)) <= 1e-10:
-        yield triangle, True, None, None, None
-        return
-
-    xs = np.arange(minimum[0], maximum[0] + 1)
-    row_count = int(maximum[1] - minimum[1] + 1)
-    rows_per_chunk = row_count
-    if len(xs) * row_count >= _CHUNKED_RASTER_PIXELS:
-        rows_per_chunk = max(
-            1,
-            _RASTER_CHUNK_PIXELS // max(1, len(xs)),
-        )
-    sampled = False
-    for start_y in range(
-        int(minimum[1]),
-        int(maximum[1]) + 1,
-        rows_per_chunk,
-    ):
-        ys = np.arange(
-            start_y,
-            min(int(maximum[1]) + 1, start_y + rows_per_chunk),
-        )
-        target_x = np.tile(xs, len(ys))
-        target_y = np.repeat(ys, len(xs))
-        relative_x = target_x + 0.5 - triangle[0, 0]
-        relative_y = target_y + 0.5 - triangle[0, 1]
-        weight1 = (
-            relative_x * second[1] - relative_y * second[0]
-        ) / denominator
-        weight2 = (
-            first[0] * relative_y - first[1] * relative_x
-        ) / denominator
-        weight0 = (1.0 - weight1 - weight2).astype(np.float32)
-        weight1 = weight1.astype(np.float32)
-        weight2 = weight2.astype(np.float32)
-        inside = (
-            (weight0 >= -1e-5)
-            & (weight1 >= -1e-5)
-            & (weight2 >= -1e-5)
-        )
-        if not np.any(inside):
+    for triangle, in_bounds, block in _triangle_raster_blocks(face, uv, width, height):
+        if block is None:
+            yield triangle, in_bounds, None, None, None
             continue
-        sampled = True
+        target_y, target_x = np.nonzero(block.inside)
         yield (
             triangle,
             True,
-            target_x[inside],
-            target_y[inside],
-            np.column_stack(
-                (
-                    weight0[inside],
-                    weight1[inside],
-                    weight2[inside],
-                )
-            ),
+            target_x + block.start_x,
+            target_y + block.start_y,
+            block.barycentric,
         )
-    if not sampled:
-        yield triangle, True, None, None, None
+
+
+def _pixel_neighbours(
+    pixels: np.ndarray,
+    width: int,
+    height: int,
+    wrap: bool,
+) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+    """Flat indices of the pixels below, above, right and left of ``pixels``.
+
+    Each comes with whether it lies inside the image; indices of outside
+    neighbours are arbitrary in-range values.
+    """
+    size = width * height
+    column = pixels % width
+    if wrap:
+        inside = np.ones(len(pixels), dtype=bool)
+        row_start = pixels - column
+        return (
+            ((pixels + width) % size, inside),
+            ((pixels - width) % size, inside),
+            (row_start + (column + 1) % width, inside),
+            (row_start + (column - 1) % width, inside),
+        )
+    return (
+        (np.minimum(pixels + width, size - 1), pixels < size - width),
+        (np.maximum(pixels - width, 0), pixels >= width),
+        (np.minimum(pixels + 1, size - 1), column < width - 1),
+        (np.maximum(pixels - 1, 0), column > 0),
+    )
 
 
 def _dilate(
@@ -397,15 +501,19 @@ def _dilate(
     wrap: bool,
     fill_remaining: bool = False,
 ) -> np.ndarray:
-    result = values
+    result = np.ascontiguousarray(values)
     covered = coverage.copy()
     height, width = covered.shape
     channels = result.shape[2]
     bytes_per_row = max(1, width * channels * result.dtype.itemsize)
     rows_per_chunk = max(1, min(128, 16 * 1024**2 // bytes_per_row))
+    texel = np.dtype((np.void, channels * result.itemsize))
+    texels = result.reshape((-1, channels)).view(texel).ravel()
+    flat_covered = covered.reshape(-1)
+    uncovered = flat_covered.size - int(np.count_nonzero(flat_covered))
     frontier: np.ndarray | None = None
     for _iteration in range(iterations):
-        if np.all(covered):
+        if not uncovered:
             break
         if frontier is None:
             candidates = np.zeros_like(covered)
@@ -421,115 +529,95 @@ def _dilate(
             candidates &= ~covered
             candidate_indices = np.flatnonzero(candidates)
         else:
-            frontier_y, frontier_x = np.divmod(frontier, width)
-            if wrap:
-                candidate_indices = np.concatenate(
-                    (
-                        ((frontier_y - 1) % height) * width + frontier_x,
-                        ((frontier_y + 1) % height) * width + frontier_x,
-                        frontier_y * width + (frontier_x - 1) % width,
-                        frontier_y * width + (frontier_x + 1) % width,
-                    )
+            candidate_indices = np.unique(
+                np.concatenate(
+                    [
+                        neighbours[valid]
+                        for neighbours, valid in _pixel_neighbours(
+                            frontier,
+                            width,
+                            height,
+                            wrap,
+                        )
+                    ]
                 )
-            else:
-                candidate_parts = (
-                    (frontier_y > 0, frontier - width),
-                    (frontier_y + 1 < height, frontier + width),
-                    (frontier_x > 0, frontier - 1),
-                    (frontier_x + 1 < width, frontier + 1),
-                )
-                candidate_indices = np.concatenate(
-                    tuple(
-                        values[valid]
-                        for valid, values in candidate_parts
-                        if np.any(valid)
-                    )
-                )
-            candidate_indices = np.unique(candidate_indices)
-            candidate_indices = candidate_indices[
-                ~covered.reshape(-1)[candidate_indices]
-            ]
+            )
+            candidate_indices = candidate_indices[~flat_covered[candidate_indices]]
         if not len(candidate_indices):
             break
 
-        target_y, target_x = np.divmod(candidate_indices, width)
         value_sum = np.zeros(
             (len(candidate_indices), channels),
             dtype=result.dtype,
         )
         neighbour_count = np.zeros(len(candidate_indices), dtype=np.uint8)
-        neighbours = (
-            (target_y + 1, target_x),
-            (target_y - 1, target_x),
-            (target_y, target_x + 1),
-            (target_y, target_x - 1),
-        )
-        for source_y, source_x in neighbours:
-            if wrap:
-                source_y %= height
-                source_x %= width
-                valid = np.ones(len(candidate_indices), dtype=bool)
-            else:
-                valid = (
-                    (source_y >= 0)
-                    & (source_y < height)
-                    & (source_x >= 0)
-                    & (source_x < width)
-                )
-                source_y = np.clip(source_y, 0, height - 1)
-                source_x = np.clip(source_x, 0, width - 1)
-            source_covered = valid & covered[source_y, source_x]
-            np.add(
-                value_sum,
-                result[source_y, source_x],
-                out=value_sum,
-                where=source_covered[:, None],
+        for neighbours, valid in _pixel_neighbours(
+            candidate_indices,
+            width,
+            height,
+            wrap,
+        ):
+            source_covered = flat_covered[neighbours]
+            source_covered &= valid
+            neighbour_values = (
+                texels[neighbours].view(result.dtype).reshape((-1, channels))
             )
+            neighbour_values[~source_covered] = 0
+            value_sum += neighbour_values
             neighbour_count += source_covered
 
         fill = neighbour_count > 0
         if not np.any(fill):
             break
-        np.divide(
-            value_sum,
-            neighbour_count[:, None],
-            out=value_sum,
-            where=fill[:, None],
-        )
-        target_y = target_y[fill]
-        target_x = target_x[fill]
-        result[target_y, target_x] = value_sum[fill]
-        covered[target_y, target_x] = True
+        filled = value_sum[fill]
+        filled /= _repeat_columns(neighbour_count[fill].astype(result.dtype), channels)
         frontier = candidate_indices[fill]
-    if fill_remaining and np.any(coverage) and not np.all(covered):
+        texels[frontier] = filled.view(texel).ravel()
+        flat_covered[frontier] = True
+        uncovered -= len(frontier)
+    if fill_remaining and np.any(coverage) and uncovered:
         total = np.zeros(channels, dtype=result.dtype)
         count = 0
         for start in range(0, height, rows_per_chunk):
             end = min(height, start + rows_per_chunk)
             mask = coverage[start:end]
+            if channels == 1:
+                total += np.sum(
+                    result[start:end],
+                    axis=(0, 1),
+                    dtype=result.dtype,
+                    where=mask[..., None],
+                )
+                count += int(np.count_nonzero(mask))
+                continue
+            # A masked multi-channel sum adds each channel in row-major order,
+            # like this cheaper sum of the covered texels along axis 0; the
+            # single-channel masked sum above uses another order.
+            covered_texels = texels[start * width:end * width][mask.reshape(-1)]
             total += np.sum(
-                result[start:end],
-                axis=(0, 1),
+                covered_texels.view(result.dtype).reshape((-1, channels)),
+                axis=0,
                 dtype=result.dtype,
-                where=mask[..., None],
             )
-            count += int(np.count_nonzero(mask))
+            count += len(covered_texels)
         mean = total / max(1, count)
+        fill_texel = np.ascontiguousarray(mean, dtype=result.dtype).view(texel)[0]
         for start in range(0, height, rows_per_chunk):
             end = min(height, start + rows_per_chunk)
-            np.copyto(
-                result[start:end],
-                mean,
-                where=(~covered[start:end])[..., None],
-            )
+            texels[start * width:end * width][~covered[start:end].reshape(-1)] = fill_texel
     return result
 
 
 def _quantize_unorm8(values: np.ndarray) -> np.ndarray:
-    np.clip(values, 0.0, 1.0, out=values)
-    np.multiply(values, 255.0, out=values)
-    np.rint(values, out=values)
-    return values.astype(np.uint8)
+    flat = values.reshape(-1)
+    result = np.empty(flat.shape, dtype=np.uint8)
+    for start in range(0, flat.size, _QUANTIZE_CHUNK_VALUES):
+        chunk = flat[start:start + _QUANTIZE_CHUNK_VALUES]
+        np.clip(chunk, 0.0, 1.0, out=chunk)
+        np.multiply(chunk, 255.0, out=chunk)
+        np.rint(chunk, out=chunk)
+        result[start:start + _QUANTIZE_CHUNK_VALUES] = chunk
+    return result.reshape(values.shape)
 
 
 def _next_pow2(value: int) -> int:
@@ -616,25 +704,26 @@ def _rasterize_color_atlas(
         else None
     )
     coverage = np.zeros((height, width), dtype=bool)
+    texel_dtype = np.dtype((np.void, 4 * color_output.itemsize))
+    color_texels = color_output.reshape((-1, 4)).view(texel_dtype).ravel()
     rasterized_faces = 0
     empty_faces = 0
     sampled_pixels = 0
 
     for face in faces:
         face_samples = 0
-        for (
-            _triangle,
-            _in_bounds,
-            target_x,
-            target_y,
-            barycentric,
-        ) in _triangle_raster_samples(face, atlas_uv, width, height):
-            if barycentric is None:
+        for _triangle, _in_bounds, block in _triangle_raster_blocks(
+            face,
+            atlas_uv,
+            width,
+            height,
+        ):
+            if block is None:
                 continue
+            barycentric = block.barycentric
             uv_a = barycentric @ source_uvs[0][face]
-            color_a = _sample(diffuse_a, uv_a)
-            color = color_a.copy()
-            linear_color = _srgb_to_linear(color_a[:, :3])
+            color = _sample(diffuse_a, uv_a)
+            linear_color = _srgb_to_linear(color[:, :3])
             if (
                 diffuse_b is not None
                 and layout.second_uv is not None
@@ -650,31 +739,29 @@ def _rasterize_color_atlas(
                 if layout.rbr_double_texture:
                     vertex_alpha = weight
                     weight = color_b[:, 3:4] * vertex_alpha
-                    alpha = color_a[:, 3:4]
+                    alpha = color[:, 3:4]
                     if layout.specular_uv is None:
                         alpha = alpha + weight * (color_b[:, 3:4] - alpha)
                     color[:, 3:4] = vertex_alpha * alpha
-                linear_color *= 1.0 - weight
+                linear_color *= _repeat_columns(1.0 - weight[:, 0], 3)
                 linear_b = _srgb_to_linear(color_b[:, :3])
-                linear_b *= weight
+                linear_b *= _repeat_columns(weight[:, 0], 3)
                 linear_color += linear_b
-            color[:, :3] = linear_color
             if multiplier is not None and layout.multiplier_uv is not None:
                 uv = barycentric @ source_uvs[layout.multiplier_uv][face]
-                multiplier_sample = _sample(multiplier, uv)
-                color[:, :3] *= _srgb_to_linear(multiplier_sample[:, :3])
+                linear_color *= _srgb_to_linear(_sample(multiplier, uv)[:, :3])
             if additive is not None and layout.additive_uv is not None:
                 uv = barycentric @ source_uvs[layout.additive_uv][face]
-                additive_sample = _sample(additive, uv)
-                color[:, :3] += _srgb_to_linear(additive_sample[:, :3])
-            np.clip(color[:, :3], 0.0, 1.0, out=color[:, :3])
-            color[:, :3] = _linear_to_srgb(color[:, :3])
+                linear_color += _srgb_to_linear(_sample(additive, uv)[:, :3])
+            np.clip(linear_color, 0.0, 1.0, out=linear_color)
+            color[:, :3] = _linear_to_srgb(linear_color)
             np.clip(color, 0.0, 1.0, out=color)
-            color_output[target_y, target_x] = color
+            pixels = block.flat_indices(width)
+            color_texels[pixels] = np.ascontiguousarray(color).view(texel_dtype).ravel()
             if clear_coat_output is not None and layout.specular_uv is not None:
                 uv = barycentric @ source_uvs[layout.specular_uv][face]
                 specular_sample = _sample(specular, uv)
-                clear_coat_output[target_y, target_x, 0] = np.clip(
+                clear_coat_output.reshape(-1)[pixels] = np.clip(
                     (
                         specular_sample[:, 0] * 0.2126
                         + specular_sample[:, 1] * 0.7152
@@ -692,8 +779,8 @@ def _rasterize_color_atlas(
                     0.0,
                     1.0,
                 )
-            coverage[target_y, target_x] = True
-            face_samples += len(target_x)
+            coverage.reshape(-1)[pixels] = True
+            face_samples += len(barycentric)
         if face_samples:
             rasterized_faces += 1
             sampled_pixels += face_samples
@@ -868,10 +955,7 @@ def _bake_atlas(
         height=height,
     ) as encode_span:
         color_pixels = _quantize_unorm8(color_output)
-        Image.fromarray(color_pixels, mode="RGBA").save(
-            current_filesystem().write_path(color_path),
-            compress_level=1,
-        )
+        save_cooker_png(color_pixels, color_path)
         encode_span.update(
             outputBytes=current_filesystem().stat(color_path).st_size,
         )
@@ -900,13 +984,7 @@ def _bake_atlas(
             height=height,
         ) as encode_span:
             clear_coat_pixels = _quantize_unorm8(clear_coat_output)
-            Image.fromarray(
-                clear_coat_pixels[:, :, 0],
-                mode="L",
-            ).save(
-                current_filesystem().write_path(clear_coat_path),
-                compress_level=1,
-            )
+            save_cooker_png(clear_coat_pixels[:, :, 0], clear_coat_path)
             encode_span.update(
                 outputBytes=current_filesystem().stat(clear_coat_path).st_size
             )
@@ -991,10 +1069,10 @@ def _rasterize_blend_mask(
     mask = np.zeros((height, width, 1), dtype=np.float32)
     mask[coverage, 0] = (accumulated[coverage] / counts[coverage]).astype(np.float32)
     mask = _dilate(mask, coverage, 8, wrap=False, fill_remaining=True)
-    Image.fromarray(
+    save_cooker_png(
         np.clip(np.rint(mask[:, :, 0] * 255.0), 0, 255).astype(np.uint8),
-        mode="L",
-    ).save(current_filesystem().write_path(target), compress_level=1)
+        target,
+    )
 
 
 def _try_vertex_pbr_lerp(

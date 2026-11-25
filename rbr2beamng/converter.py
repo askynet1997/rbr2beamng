@@ -32,7 +32,7 @@ from .conversion_common import (
     resolved_map_altitude_meters,
     temporary_workspace,
 )
-from .core import ConversionError, ProgressReporter, slugify
+from .core import ConversionError, ProgressReporter, slugify, stage_level_id
 from .environment import (
     EnvironmentSettings,
     location_override,
@@ -48,6 +48,7 @@ from .geometry import (
     extract_thin_wall_templates,
     inflate_thin_wall_templates,
     lod_detail_size,
+    partition_collision_parts,
     remap_mesh_part,
     rbr_col_box_part,
     rbr_stuff_source_matrices,
@@ -2514,7 +2515,12 @@ def _convert(
         environment_variant=options.environment,
         environment_date=options.environment_date,
     )
-    level_id = f"rbr_{slugify(stage.metadata.folder_name)}"
+    level_id = stage_level_id(
+        stage.metadata.folder_name,
+        display_name=stage.metadata.name,
+        source_format=stage.source_format,
+        rbr_root=options.rbr_root,
+    )
     destination = output_path_for(options, level_id)
     if filesystem.exists(destination) and not options.overwrite:
         raise ConversionError(f"Output already exists: {destination}. Use --overwrite to replace it.")
@@ -2649,13 +2655,13 @@ def _convert(
                 collisionTriangles=static_collision_triangles,
             )
         if thin_wall_repairs:
-            thin_wall_archive_name = (
-                f"levels/{level_id}/art/shapes/thin_wall_collision.dae"
-            )
+            thin_wall_chunks = partition_collision_parts(thin_wall_repairs)
+            single_thin_wall_chunk = len(thin_wall_chunks) == 1
             with profile_span(
                 "write_thin_wall_collision",
                 category="collada",
                 parts=len(thin_wall_repairs),
+                chunks=len(thin_wall_chunks),
             ):
                 with zipfile.ZipFile(
                     filesystem.write_path(prepared_zip),
@@ -2664,35 +2670,48 @@ def _convert(
                     compresslevel=ZIP_COMPRESSLEVEL,
                     allowZip64=True,
                 ) as shape_archive:
-                    _, _, repair_triangles = write_collada_to_archive(
-                        shape_archive,
-                        thin_wall_archive_name,
-                        thin_wall_repairs,
-                        collision_only=True,
-                    )
-            archived_paths.add(thin_wall_archive_name)
-            statics.append(
-                StaticInstance(
-                    key="thin_wall_collision",
-                    shape_vfs=f"/{thin_wall_archive_name}",
-                    position=[0.0, 0.0, 0.0],
-                    rotation=[
-                        1.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        1.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        1.0,
-                    ],
-                    scale=[1.0, 1.0, 1.0],
-                    visible=True,
-                    collision_type="Collision Mesh",
-                )
-            )
-            static_collision_triangles += repair_triangles
+                    for chunk_index, (
+                        chunk_position,
+                        chunk_parts,
+                    ) in enumerate(thin_wall_chunks):
+                        suffix = (
+                            ""
+                            if single_thin_wall_chunk
+                            else f"_{chunk_index:04d}"
+                        )
+                        thin_wall_archive_name = (
+                            f"levels/{level_id}/art/shapes/"
+                            f"thin_wall_collision{suffix}.dae"
+                        )
+                        _, _, repair_triangles = write_collada_to_archive(
+                            shape_archive,
+                            thin_wall_archive_name,
+                            chunk_parts,
+                            collision_only=True,
+                        )
+                        archived_paths.add(thin_wall_archive_name)
+                        statics.append(
+                            StaticInstance(
+                                key=f"thin_wall_collision{suffix}",
+                                shape_vfs=f"/{thin_wall_archive_name}",
+                                position=chunk_position,
+                                rotation=[
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    1.0,
+                                ],
+                                scale=[1.0, 1.0, 1.0],
+                                visible=True,
+                                collision_type="Collision Mesh",
+                            )
+                        )
+                        static_collision_triangles += repair_triangles
             if thin_wall_stats["repaired"]:
                 warnings.append(
                     "Inflated "

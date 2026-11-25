@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Mapping
 
 from ..core import ConversionError, ProgressReporter, slugify
-from ..filesystem import current_filesystem
+from ..filesystem import SandboxViolationError, current_filesystem
 from ..models import RbrStage, StageDocument, StageInspection, StageMetadata
 from ..rbr import location_for_country_code, rsf_catalog_entries
 from .catalog import (
@@ -16,6 +16,7 @@ from .catalog import (
     OriginalCatalogEntry,
     OriginalStageFiles,
     Tint,
+    _case_value,
     parse_tracks_ini,
 )
 
@@ -110,7 +111,7 @@ def _surface(rsf: dict[str, object], properties: Mapping[str, str]) -> str:
     if values:
         return max(values.items(), key=lambda item: item[1])[0]
     return _RSF_SURFACE_IDS.get(str(rsf.get("surface_id", "")).strip()) or _TRACKS_INI_SURFACES.get(
-        str(properties.get("Surface", "")).strip(), "unknown"
+        _case_value(properties, "Surface").strip(), "unknown"
     )
 
 
@@ -158,7 +159,7 @@ def _document_index(
 
 
 def _country_code(entry: OriginalCatalogEntry, rsf: dict[str, object]) -> str:
-    return str(rsf.get("short_country") or entry.properties.get("CountryCode") or "")
+    return str(rsf.get("short_country") or _case_value(entry.properties, "CountryCode") or "")
 
 
 def original_country_code(rbr_root: Path, entry: OriginalCatalogEntry) -> str:
@@ -177,8 +178,8 @@ def _metadata(
     variants: tuple[Tint, ...],
     splashscreen: Path | None,
 ) -> StageMetadata:
-    length = _number(rsf.get("length")) or _number(entry.properties.get("Length"))
-    author = str(rsf.get("author") or entry.properties.get("Author") or "Unknown")
+    length = _number(rsf.get("length")) or _number(_case_value(entry.properties, "Length"))
+    author = str(rsf.get("author") or _case_value(entry.properties, "Author", "Unknown"))
     name = str(rsf.get("name") or entry.stage_name or f"Original RBR stage {entry.stage_id}")
     return StageMetadata(
         folder_name=f"original:{entry.stage_id}",
@@ -193,6 +194,7 @@ def _metadata(
         surface_composition=_surface_composition(rsf),
         author_website=str(rsf.get("author_web") or "").strip(),
         author_note=str(rsf.get("author_note") or "").strip(),
+        country_code=_country_code(entry, rsf),
     )
 
 
@@ -320,6 +322,43 @@ def original_stage_id(selector: str) -> int | None:
         except ValueError as exc:
             raise ConversionError(f"Invalid Original RBR stage selector: {selector}") from exc
     return None
+
+
+@lru_cache(maxsize=4)
+def _original_stage_slugs(path: str) -> frozenset[str]:
+    root = Path(path)
+    try:
+        filesystem = current_filesystem()
+        tracks_ini = root / "Maps" / "Tracks.ini"
+        if not filesystem.is_file(tracks_ini):
+            return frozenset()
+        catalog = _catalog(path)
+        rsf = _rsf_entries(path)
+    except (CatalogError, OSError, SandboxViolationError, RuntimeError):
+        tracks_ini = root / "Maps" / "Tracks.ini"
+        if not tracks_ini.is_file():
+            return frozenset()
+        try:
+            catalog = parse_tracks_ini(tracks_ini, install_root=root)
+            rsf = {}
+        except (CatalogError, OSError):
+            return frozenset()
+    slugs = set()
+    for entry in catalog.entries.values():
+        rsf_data = rsf.get(entry.stage_id, {})
+        name = str(rsf_data.get("name") or entry.stage_name or f"Original RBR stage {entry.stage_id}")
+        slugs.add(slugify(name)[:100])
+        if entry.stage_name:
+            slugs.add(slugify(entry.stage_name)[:100])
+    return frozenset(slugs)
+
+
+def original_stage_slugs(rbr_root: Path) -> frozenset[str]:
+    try:
+        path_str = str(current_filesystem().read_path(rbr_root))
+    except (SandboxViolationError, RuntimeError):
+        path_str = str(rbr_root)
+    return _original_stage_slugs(path_str)
 
 
 def discover_original_pacenote_sources(

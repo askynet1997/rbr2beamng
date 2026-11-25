@@ -1395,8 +1395,9 @@ def _xml_id(value: str) -> str:
 _FLOAT_CHUNK = 16384
 _FLOAT_CHUNK_FORMAT = " ".join(("%.8g",) * _FLOAT_CHUNK)
 _FLOAT_REPETITION_SAMPLE = 1024
-_INDEX_CHUNK = 4096
+_INDEX_CHUNK = 16384
 _INDEX_CHUNK_FORMAT = " ".join(("%d",) * _INDEX_CHUNK)
+_INDEX_TEXT_LIMIT = 100_000_000
 _POWERS_OF_TEN = 10.0 ** np.arange(13)
 _FOUR_DIGITS = np.array(
     [int.from_bytes(b"%04d" % value, "little") for value in range(10000)],
@@ -1406,6 +1407,7 @@ _TRAILING_ZEROS = np.array(
     [4] + [len(str(value)) - len(str(value).rstrip("0")) for value in range(1, 10000)],
     dtype=np.intp,
 )
+_DIGIT_COUNTS = np.array([len(str(value)) for value in range(10000)], dtype=np.uint64)
 _BYTE_MASKS = np.array(
     [(1 << (8 * count)) - 1 for count in range(9)], dtype=np.uint64
 )
@@ -1425,7 +1427,7 @@ _FLOAT_PREFIX_WORDS = np.array(
 _FLOAT_PREFIX_BITS = np.array(
     [8 * len(prefix) for prefix in _FLOAT_PREFIXES], dtype=np.uint64
 )
-_FIELD_MASKS = np.arange(16) < np.arange(17)[:, None]
+_SPACE = np.uint64(ord(" "))
 
 
 def _float32_text(values: np.ndarray) -> str:
@@ -1433,8 +1435,9 @@ def _float32_text(values: np.ndarray) -> str:
 
     A float32 times 10**p is exact in float64 for p <= 12, so rounding that
     product to an integer gives %g's correctly rounded 8 significant digits.
-    Each value's text is assembled little-endian in a 16-byte field. Values %g writes in
-    exponent form, and non-finite values, are formatted one by one.
+    Each value's text and its trailing space are assembled little-endian in a
+    16-byte field padded with zero bytes, which are then dropped. Values %g
+    writes in exponent form, and non-finite values, are formatted one by one.
     """
     with np.errstate(divide="ignore", invalid="ignore"):
         magnitude = np.abs(values).astype(np.float64)
@@ -1476,18 +1479,22 @@ def _float32_text(values: np.ndarray) -> str:
     overflow = np.where(inner_point, text >> np.uint64(56), 0)
     prefix = np.signbit(values) * 12 + exponent + 4
     shift = _FLOAT_PREFIX_BITS[prefix]
+    space = shift + ((kept + inner_point).astype(np.uint64) << np.uint64(3))
     fields = np.empty((len(values), 2), dtype=np.uint64)
-    fields[:, 0] = _FLOAT_PREFIX_WORDS[prefix] | (body << shift)
     # numpy shifts by 64 or more bits give 0.
-    fields[:, 1] = (overflow << shift) | (body >> (np.uint64(64) - shift))
-    length = (shift >> np.uint64(3)).astype(np.intp) + kept + inner_point
+    fields[:, 0] = _FLOAT_PREFIX_WORDS[prefix] | (body << shift) | (_SPACE << space)
+    fields[:, 1] = (
+        (overflow << shift)
+        | (body >> (np.uint64(64) - shift))
+        | (_SPACE << (space - np.uint64(64)))
+    )
     chars = fields.view(np.uint8)
-    chars[np.arange(len(values)), length] = ord(" ")
     for index in np.flatnonzero(~regular & (magnitude != 0)).tolist():
         special = b"%.8g " % float(values[index])
+        chars[index] = 0
         chars[index, : len(special)] = np.frombuffer(special, dtype=np.uint8)
-        length[index] = len(special) - 1
-    return chars[_FIELD_MASKS[length + 1]][:-1].tobytes().decode("ascii")
+    chars = chars.reshape(-1)
+    return chars[chars != 0][:-1].tobytes().decode("ascii")
 
 
 def _write_floats(stream: TextIO, values: np.ndarray) -> None:
@@ -1555,21 +1562,196 @@ def _write_collada_source(
     stream.write("</accessor></technique_common></source>\n")
 
 
+def _index_text(values: np.ndarray) -> str:
+    """``" ".join("%d" % value for value in values)`` for int64 ``values`` in
+    [0, _INDEX_TEXT_LIMIT).
+
+    Each value's digits and its trailing space are assembled little-endian in
+    one 8-byte word, or two when some value has eight digits, and the unused
+    zero bytes are dropped.
+    """
+    high = values // 10000
+    low = values - high * 10000
+    count = np.where(high > 0, _DIGIT_COUNTS[high] + np.uint64(4), _DIGIT_COUNTS[low])
+    text = _FOUR_DIGITS[high] | (_FOUR_DIGITS[low] << np.uint64(32))
+    space = count << np.uint64(3)
+    # numpy shifts by 64 or more bits give 0.
+    words = (text >> (np.uint64(64) - space)) | (_SPACE << space)
+    if int(count.max()) < 8:
+        chars = words.view(np.uint8)
+    else:
+        fields = np.empty((len(values), 2), dtype=np.uint64)
+        fields[:, 0] = words
+        fields[:, 1] = np.where(count == 8, _SPACE, np.uint64(0))
+        chars = fields.view(np.uint8).reshape(-1)
+    return chars[chars != 0][:-1].tobytes().decode("ascii")
+
+
 def _write_indices(stream: TextIO, values: np.ndarray, offset: int = 0) -> None:
     flat = np.asarray(values).reshape(-1)
     for start in range(0, flat.size, _INDEX_CHUNK):
         if start:
             stream.write(" ")
-        chunk = tuple(
-            (flat[start : start + _INDEX_CHUNK].astype(np.int64) + offset).tolist()
-        )
-        stream.write(_INDEX_CHUNK_FORMAT[: 3 * len(chunk) - 1] % chunk)
+        chunk = flat[start : start + _INDEX_CHUNK].astype(np.int64) + offset
+        if chunk.min() >= 0 and chunk.max() < _INDEX_TEXT_LIMIT:
+            stream.write(_index_text(chunk))
+            continue
+        values_tuple = tuple(chunk.tolist())
+        stream.write(_INDEX_CHUNK_FORMAT[: 3 * len(values_tuple) - 1] % values_tuple)
+
+
+DEFAULT_COLLISION_CHUNK_TRIANGLES = 16_384
 
 
 def _collision_faces(part: MeshPart) -> np.ndarray:
     if not part.collision_eligible:
         return np.empty((0, 3), dtype=np.uint32)
     return part.faces
+
+
+def partition_collision_parts(
+    parts: list[MeshPart],
+    *,
+    max_triangles: int = DEFAULT_COLLISION_CHUNK_TRIANGLES,
+) -> list[tuple[list[float], list[MeshPart]]]:
+    """Split collision-only parts into spatially centered chunks bounded by
+    ``max_triangles`` so BeamNG builds small per-chunk Opcode trees instead of
+    stalling on one stage-wide mesh."""
+    if max_triangles <= 0:
+        raise ConversionError("Collision chunk triangle limit must be positive")
+    active: list[tuple[MeshPart, np.ndarray]] = []
+    counts: list[int] = []
+    for part in parts:
+        faces = np.asarray(_collision_faces(part), dtype=np.uint32).reshape((-1, 3))
+        if len(faces):
+            active.append((part, faces))
+            counts.append(len(faces))
+    total_triangles = sum(counts)
+    if total_triangles == 0:
+        return []
+    if total_triangles <= max_triangles:
+        return [([0.0, 0.0, 0.0], list(parts))]
+
+    centroids = np.concatenate(
+        [
+            np.asarray(part.vertices, dtype=np.float32)[faces].mean(axis=1)
+            for part, faces in active
+        ],
+        axis=0,
+    )
+    part_ids = np.repeat(np.arange(len(active), dtype=np.int32), counts)
+    face_indices = np.concatenate(
+        [np.arange(count, dtype=np.int32) for count in counts]
+    )
+
+    stack: list[np.ndarray] = [np.arange(total_triangles, dtype=np.int32)]
+    leaves: list[np.ndarray] = []
+    while stack:
+        current = stack.pop()
+        if len(current) <= max_triangles:
+            leaves.append(current)
+            continue
+        pts = centroids[current]
+        span = pts.max(axis=0) - pts.min(axis=0)
+        axis = int(np.argmax(span))
+        if float(span[axis]) <= 0.0:
+            leaves.append(current)
+            continue
+        mid = len(current) // 2
+        order = np.argpartition(pts[:, axis], mid)
+        left = current[order[:mid]]
+        right = current[order[mid:]]
+        if not len(left) or not len(right):
+            leaves.append(current)
+            continue
+        stack.append(right)
+        stack.append(left)
+
+    chunks: list[tuple[list[float], list[MeshPart]]] = []
+    for chunk_index, leaf in enumerate(leaves):
+        leaf.sort()
+        leaf_part_ids = part_ids[leaf]
+        split_points = (
+            np.flatnonzero(leaf_part_ids[1:] != leaf_part_ids[:-1]) + 1
+        )
+        starts = np.concatenate(([0], split_points))
+        ends = np.concatenate((split_points, [len(leaf)]))
+
+        by_material: dict[
+            str,
+            tuple[int, list[np.ndarray], list[np.ndarray]],
+        ] = {}
+        bounds_min: np.ndarray | None = None
+        bounds_max: np.ndarray | None = None
+        for start, end in zip(starts, ends):
+            part, faces = active[int(leaf_part_ids[start])]
+            sub_faces = faces[face_indices[leaf[start:end]]]
+            used_verts, compact_faces = _used_vertices(
+                sub_faces,
+                len(part.vertices),
+            )
+            sub_verts = np.asarray(part.vertices, dtype=np.float32)[used_verts]
+            sub_min = sub_verts.min(axis=0)
+            sub_max = sub_verts.max(axis=0)
+            bounds_min = (
+                sub_min if bounds_min is None else np.minimum(bounds_min, sub_min)
+            )
+            bounds_max = (
+                sub_max if bounds_max is None else np.maximum(bounds_max, sub_max)
+            )
+            entry = by_material.get(part.material_name)
+            if entry is None:
+                by_material[part.material_name] = (
+                    part.material_index,
+                    [sub_verts],
+                    [compact_faces.astype(np.uint32, copy=False)],
+                )
+            else:
+                entry[1].append(sub_verts)
+                entry[2].append(compact_faces.astype(np.uint32, copy=False))
+
+        assert bounds_min is not None and bounds_max is not None
+        center = (
+            (bounds_min.astype(np.float64) + bounds_max.astype(np.float64)) * 0.5
+        ).astype(np.float32)
+        center64 = center.astype(np.float64)
+
+        chunk_parts: list[MeshPart] = []
+        for material_name in sorted(by_material):
+            material_index, vert_blocks, face_blocks = by_material[material_name]
+            if len(vert_blocks) == 1:
+                merged_verts = vert_blocks[0]
+                merged_faces = face_blocks[0]
+            else:
+                offset = 0
+                shifted_faces: list[np.ndarray] = []
+                for verts_block, faces_block in zip(vert_blocks, face_blocks):
+                    shifted_faces.append(
+                        faces_block + np.uint32(offset)
+                        if offset
+                        else faces_block
+                    )
+                    offset += len(verts_block)
+                merged_verts = np.concatenate(vert_blocks, axis=0)
+                merged_faces = np.concatenate(shifted_faces, axis=0)
+            local_verts = (
+                merged_verts.astype(np.float64) - center64
+            ).astype(np.float32)
+            chunk_parts.append(
+                MeshPart(
+                    name=f"collision_chunk_{chunk_index:04d}_{material_name}",
+                    vertices=local_verts,
+                    faces=merged_faces.reshape((-1, 3)),
+                    normals=None,
+                    texcoords=None,
+                    colors=None,
+                    material_index=material_index,
+                    material_name=material_name,
+                    collision_eligible=True,
+                )
+            )
+        chunks.append((center.tolist(), chunk_parts))
+    return chunks
 
 
 def _collision_part_digest(part: MeshPart, faces: np.ndarray) -> bytes:
@@ -1649,6 +1831,19 @@ def _unique_rows(
     return sorted_values[first], order[first], inverse
 
 
+def _used_vertices(
+    faces: np.ndarray,
+    vertex_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``np.unique(faces, return_inverse=True)`` for indices below
+    ``vertex_count``, marked off in place of sorting when that is cheaper."""
+    if vertex_count > 4 * faces.size:
+        return np.unique(faces, return_inverse=True)
+    used = np.zeros(vertex_count, dtype=bool)
+    used[faces] = True
+    return np.flatnonzero(used).astype(faces.dtype), (np.cumsum(used) - 1)[faces]
+
+
 def _weld_collision_faces(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -1658,7 +1853,7 @@ def _weld_collision_faces(
     faces = np.asarray(faces, dtype=np.uint32).reshape((-1, 3))
     if not len(faces):
         return None
-    used_vertices, compact_faces = np.unique(faces, return_inverse=True)
+    used_vertices, compact_faces = _used_vertices(faces, len(vertices))
     compact_faces = compact_faces.reshape((-1, 3))
     compact_vertices = np.asarray(vertices)[used_vertices]
     unique_vertices, first_indices, inverse_vertices = _unique_rows(
@@ -1721,7 +1916,7 @@ def _compact_collision_part(
 
 def _compact_mesh_part(part: MeshPart) -> MeshPart:
     faces = np.asarray(part.faces, dtype=np.uint32).reshape((-1, 3))
-    used_vertices, compact_faces = np.unique(faces, return_inverse=True)
+    used_vertices, compact_faces = _used_vertices(faces, len(part.vertices))
     if len(used_vertices) == len(part.vertices):
         return part
     return remap_mesh_part(
@@ -1990,6 +2185,32 @@ def _nearest_opposed_faces(
     return np.concatenate(found_faces), np.concatenate(found_others)
 
 
+def _component_minimums(
+    count: int,
+    first: np.ndarray,
+    second: np.ndarray,
+) -> np.ndarray:
+    """The smallest node of each node's connected component, for edges
+    ``first[i]``-``second[i]`` between nodes ``0..count - 1``."""
+    labels = np.arange(count)
+    while True:
+        first_labels = labels[first]
+        second_labels = labels[second]
+        differ = first_labels != second_labels
+        if not np.any(differ):
+            return labels
+        first_labels = first_labels[differ]
+        second_labels = second_labels[differ]
+        smaller = np.minimum(first_labels, second_labels)
+        np.minimum.at(labels, first_labels, smaller)
+        np.minimum.at(labels, second_labels, smaller)
+        while True:
+            jumped = labels[labels]
+            if np.array_equal(jumped, labels):
+                break
+            labels = jumped
+
+
 def detect_thin_wall_shells(
     part: MeshPart,
     *,
@@ -2055,55 +2276,77 @@ def detect_thin_wall_shells(
     if not face_pairs:
         return ()
 
-    parent = list(range(len(face_pairs)))
-
-    def root(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(first: int, second: int) -> None:
-        first_root = root(first)
-        second_root = root(second)
-        if first_root != second_root:
-            parent[second_root] = first_root
-
-    by_vertex: dict[int, list[int]] = defaultdict(list)
-    for pair_index, (first, second) in enumerate(face_pairs):
-        for vertex_index in np.unique(
-            np.concatenate((faces[first], faces[second]))
-        ):
-            by_vertex[int(vertex_index)].append(pair_index)
-    for pair_indices in by_vertex.values():
-        for pair_index in pair_indices[1:]:
-            union(pair_indices[0], pair_index)
-
-    grouped: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    for pair_index, pair in enumerate(face_pairs):
-        grouped[root(pair_index)].append(pair)
-
-    shells: list[ThinWallShell] = []
-    for pairs in grouped.values():
-        source_faces = sorted({face for pair in pairs for face in pair})
-        component_vertices = vertices[
-            np.unique(faces[source_faces].reshape(-1))
-        ]
-        extent = np.ptp(component_vertices, axis=0)
-        paired_area = float(np.sum(areas[source_faces]) * 0.5)
-        if (
-            extent[2] < 0.25
-            or extent[2] > 5.0
-            or paired_area < 0.2
-        ):
-            continue
-        shells.append(
-            ThinWallShell(
-                face_pairs=tuple(pairs),
-                source_faces=tuple(source_faces),
-            )
+    # Each pair joins the first pair that shares one of its vertices.
+    pair_array = np.asarray(face_pairs, dtype=np.int64)
+    pair_vertices = faces[pair_array].reshape(-1)
+    order = np.argsort(pair_vertices, kind="stable")
+    sorted_vertices = pair_vertices[order]
+    sorted_pairs = order // 6
+    starts = np.flatnonzero(
+        np.concatenate(([True], sorted_vertices[1:] != sorted_vertices[:-1]))
+    )
+    first_pairs = np.repeat(
+        sorted_pairs[starts],
+        np.diff(np.append(starts, len(sorted_pairs))),
+    )
+    joined = first_pairs != sorted_pairs
+    # Components numbered in order of their first pair.
+    first_pair_of_component, components = np.unique(
+        _component_minimums(
+            len(face_pairs),
+            first_pairs[joined],
+            sorted_pairs[joined],
+        ),
+        return_inverse=True,
+    )
+    component_count = len(first_pair_of_component)
+    components = components.reshape(-1)
+    pair_order = np.argsort(components, kind="stable")
+    pair_starts = np.searchsorted(components[pair_order], np.arange(component_count + 1))
+    # Each component's source faces, ascending.
+    face_components = np.repeat(components, 2)
+    face_values = pair_array.reshape(-1)
+    face_order = np.lexsort((face_values, face_components))
+    face_components = face_components[face_order]
+    face_values = face_values[face_order]
+    distinct = np.concatenate(
+        (
+            [True],
+            (face_components[1:] != face_components[:-1])
+            | (face_values[1:] != face_values[:-1]),
         )
-    return tuple(shells)
+    )
+    face_components = face_components[distinct]
+    face_values = face_values[distinct]
+    face_starts = np.searchsorted(face_components, np.arange(component_count + 1))
+    face_heights = vertices[faces[face_values], 2]
+    extents = np.maximum.reduceat(
+        face_heights.max(axis=1), face_starts[:-1]
+    ) - np.minimum.reduceat(face_heights.min(axis=1), face_starts[:-1])
+    paired_areas = np.add.reduceat(areas[face_values], face_starts[:-1]) * 0.5
+    # np.sum adds pairwise, so areas this close to the limit are summed its way.
+    for component in np.flatnonzero(np.abs(paired_areas - 0.2) <= 1e-9).tolist():
+        paired_areas[component] = float(
+            np.sum(areas[face_values[face_starts[component] : face_starts[component + 1]]])
+            * 0.5
+        )
+    kept = ~((extents < 0.25) | (extents > 5.0) | (paired_areas < 0.2))
+    pair_list = pair_order.tolist()
+    face_list = face_values.tolist()
+    pair_bounds = pair_starts.tolist()
+    face_bounds = face_starts.tolist()
+    return tuple(
+        ThinWallShell(
+            face_pairs=tuple(
+                face_pairs[index]
+                for index in pair_list[pair_bounds[component] : pair_bounds[component + 1]]
+            ),
+            source_faces=tuple(
+                face_list[face_bounds[component] : face_bounds[component + 1]]
+            ),
+        )
+        for component in np.flatnonzero(kept).tolist()
+    )
 
 
 def extract_thin_wall_templates(
@@ -2285,17 +2528,20 @@ def _thin_wall_world_vertices(
     return (homogeneous @ np.asarray(matrix).T)[:, :3]
 
 
-def _route_queries(
-    queries: Sequence[np.ndarray],
-    route_positions: np.ndarray,
-) -> list[tuple[np.ndarray, np.ndarray]]:
-    """``_nearest_route_points`` of each query, answered by one call."""
-    nearest, distances = _nearest_route_points(
-        np.concatenate(queries),
-        route_positions,
-    )
-    bounds = np.cumsum([len(query) for query in queries])[:-1]
-    return list(zip(np.split(nearest, bounds), np.split(distances, bounds)))
+def _cross_rows(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """``np.cross`` of (n, 3) arrays, with its arithmetic but not its per-call
+    axis handling."""
+    result = np.empty(first.shape, dtype=np.promote_types(first.dtype, second.dtype))
+    for axis, (left, right) in enumerate(((1, 2), (2, 0), (0, 1))):
+        np.multiply(first[:, left], second[:, right], out=result[:, axis])
+        result[:, axis] -= first[:, right] * second[:, left]
+    return result
+
+
+def _axis_mean(values: np.ndarray, axis: int) -> np.ndarray:
+    """``np.mean(values, axis=axis)``: the same sum and division, without its
+    per-call overhead."""
+    return np.add.reduce(values, axis=axis) / values.shape[axis]
 
 
 def _inflate_part_thin_walls(
@@ -2315,24 +2561,30 @@ def _inflate_part_thin_walls(
         np.asarray(template.shell.face_pairs, dtype=np.int64)
         for template in templates
     ]
-    pair_centroids = [
-        np.mean(world_vertices[source_faces[faces]], axis=2)
-        for faces in pair_faces
-    ]
-    pair_queries = _route_queries(
-        [np.mean(centroids, axis=1) for centroids in pair_centroids],
-        route_positions,
+    bounds = np.cumsum([len(faces) for faces in pair_faces])[:-1]
+    all_faces = np.concatenate(pair_faces)
+    all_centroids = _axis_mean(world_vertices[source_faces[all_faces]], 2)
+    all_midpoints = _axis_mean(all_centroids, 1)
+    all_nearest, _distances = _nearest_route_points(all_midpoints, route_positions)
+    first = world_vertices[source_faces[all_faces[:, 0]]]
+    all_wall_normals = _cross_rows(first[:, 1] - first[:, 0], first[:, 2] - first[:, 0])
+    paired_faces = np.unique(all_faces)
+    paired_triangles = world_vertices[source_faces[paired_faces]]
+    paired_normals = _cross_rows(
+        paired_triangles[:, 1] - paired_triangles[:, 0],
+        paired_triangles[:, 2] - paired_triangles[:, 0],
     )
     repairs: list[MeshPart | None] = []
-    for faces, centroids, (nearest, _distances), name in zip(
+    for faces, centroids, midpoints, nearest, wall_normals, name in zip(
         pair_faces,
-        pair_centroids,
-        pair_queries,
+        np.split(all_centroids, bounds),
+        np.split(all_midpoints, bounds),
+        np.split(all_nearest, bounds),
+        np.split(all_wall_normals, bounds),
         names,
     ):
-        first = world_vertices[source_faces[faces[:, 0]]]
-        wall_normals = np.cross(first[:, 1] - first[:, 0], first[:, 2] - first[:, 0])
-        route_offsets = nearest - np.mean(centroids, axis=1)
+        wall_normals = wall_normals.copy()
+        route_offsets = nearest - midpoints
         route_offsets[:, 2] = 0.0
         route_sides = np.einsum("ij,ij->i", route_offsets, wall_normals)
         first_sides = np.einsum("ij,ij->i", centroids[:, 0] - centroids[:, 1], wall_normals)
@@ -2340,11 +2592,8 @@ def _inflate_part_thin_walls(
             np.where(first_sides * route_sides >= 0, faces[:, 0], faces[:, 1]),
             return_index=True,
         )
-        triangles = world_vertices[source_faces[inner_indices]].copy()
-        raw_normals = np.cross(
-            triangles[:, 1] - triangles[:, 0],
-            triangles[:, 2] - triangles[:, 0],
-        )
+        triangles = world_vertices[source_faces[inner_indices]]
+        raw_normals = paired_normals[np.searchsorted(paired_faces, inner_indices)]
         away_from_route = np.einsum(
             "ij,ij->i",
             raw_normals,
@@ -2376,7 +2625,7 @@ def _inflated_thin_wall(
     """Close the inner faces, whose normals face the route side, into a shell
     reaching 0.5 m behind them."""
     points = inner_vertices.astype(np.float64)
-    normals = np.cross(
+    normals = _cross_rows(
         points[inner_faces[:, 1]] - points[inner_faces[:, 0]],
         points[inner_faces[:, 2]] - points[inner_faces[:, 0]],
     )

@@ -14,7 +14,6 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
-from zlib_ng import zlib_ng
 
 from . import __version__
 from .core import ConversionError, slugify, stable_uuid
@@ -52,10 +51,18 @@ from .pacenotes import (
 from .pacenote_visualizer import render_pacenote_visualizer
 from .profiling import profile_span
 from .surface_profiles import current_surface_rules
-from .texture_cooker import CookedTextures, cook_textures
+from .texture_cooker import CookedTextures, cook_textures, save_cooker_png
 
 
 _COOKABLE_TEXTURE_SUFFIXES = (".color.png", ".normal.png", ".data.png")
+_PNG_SIGNATURE_AND_IHDR = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+# IHDR bit depth, colour type, compression, filter and interlace bytes.
+_PLAIN_PNG_FORMATS = {
+    bytes((8, 0, 0, 0, 0)): "L",
+    bytes((8, 2, 0, 0, 0)): "RGB",
+    bytes((8, 6, 0, 0, 0)): "RGBA",
+}
+_PLAIN_PNG_ROLE_MODES = {"color": ("RGB", "RGBA"), "normal": ("RGB",)}
 # BeamNG decodes a version 1.5 baseColorMap as sRGB only when the DDS format
 # says so; legacy FourCC headers load as linear UNORM and render washed out.
 _SRGB_DXGI_FORMATS = {b"DXT1": 72, b"DXT3": 75, b"DXT5": 78}
@@ -190,8 +197,9 @@ def _stage_title(
     environment: str | None = None,
     *,
     rally: bool = False,
+    title_suffix: str = "",
 ) -> str:
-    title = metadata.name
+    title = f"{metadata.name} {title_suffix}".strip() if title_suffix else metadata.name
     country = getattr(location, "country", "")
     if country and country != "Unknown":
         title = f"{title}, {country}"
@@ -211,8 +219,9 @@ def _stage_description(
     environment: str | None = None,
     available_environments: tuple[str, ...] = (),
     rally: bool = True,
+    title_suffix: str = "",
 ) -> str:
-    title = _stage_title(metadata, location)
+    title = _stage_title(metadata, location, title_suffix=title_suffix)
     surface = (
         f"surface mix: {metadata.surface_composition_text}"
         if metadata.surface_composition
@@ -247,7 +256,10 @@ def write_mod_info(
     location=None,
     available_environments: tuple[str, ...] = (),
     rally: bool = True,
+    title_suffix: str | None = None,
 ) -> None:
+    if title_suffix is None:
+        title_suffix = "[RX]" if package_id.endswith("_rx") else ""
     filesystem = current_filesystem()
     timestamp = int(time.time())
     mod_id = _mod_info_id(package_id)
@@ -258,13 +270,14 @@ def write_mod_info(
         location,
         available_environments=available_environments,
         rally=rally,
+        title_suffix=title_suffix,
     )
     preview = _preview_image(metadata, (512, 288))
     kind = "Rally Stage" if rally else "Freeroam"
     write_json(
         mod_info_dir / "info.json",
         {
-            "title": f"{kind}: {_stage_title(metadata, location)}",
+            "title": f"{kind}: {_stage_title(metadata, location, title_suffix=title_suffix)}",
             "username": author,
             "author": author,
             "icon": "icon.jpg",
@@ -294,6 +307,7 @@ class StaticInstance:
     visible: bool
     collision_type: str
     dynamic: bool = False
+    decal_type: str | None = None
 
 
 @dataclass
@@ -897,55 +911,31 @@ def _srgb_dds(data: bytes) -> bytes | None:
     return data[:84] + b"DX10" + data[88:128] + dx10 + data[128:]
 
 
-_PNG_COLOR_TYPES = {"L": 0, "RGB": 2, "RGBA": 6}
-_PNG_BAND_ROWS = 64
-
-
-def _write_png_chunk(stream, kind: bytes, data: bytes) -> None:
-    stream.write(struct.pack(">I", len(data)) + kind)
-    stream.write(data)
-    stream.write(struct.pack(">I", zlib_ng.crc32(data, zlib_ng.crc32(kind))))
-
-
-def _save_cooker_png(image: Image.Image, target: Path) -> None:
-    """Save the chunks Pillow writes at compress_level=0, with unfiltered rows.
-
-    Pillow still picks a filter for every row without compression, and
-    texconv decodes the same pixels either way.
-    """
-    filesystem = current_filesystem()
-    color_type = _PNG_COLOR_TYPES.get(image.mode)
-    if (
-        color_type is None
-        or image.info.get("icc_profile")
-        or image.info.get("transparency") is not None
-    ):
-        image.save(filesystem.write_path(target), format="PNG", compress_level=0)
-        return
-    width, height = image.size
-    rows = np.zeros(
-        (_PNG_BAND_ROWS, width * len(image.getbands()) + 1),
-        dtype=np.uint8,
-    )
-    compressor = zlib_ng.compressobj(0)
-    with filesystem.open(target, "wb") as stream:
-        stream.write(b"\x89PNG\r\n\x1a\n")
-        _write_png_chunk(
-            stream,
-            b"IHDR",
-            struct.pack(">2I5B", width, height, 8, color_type, 0, 0, 0),
-        )
-        for start in range(0, height, _PNG_BAND_ROWS):
-            end = min(start + _PNG_BAND_ROWS, height)
-            band = rows[: end - start]
-            band[:, 1:] = np.frombuffer(
-                image.crop((0, start, width, end)).tobytes(),
-                dtype=np.uint8,
-            ).reshape(len(band), -1)
-            if data := compressor.compress(band):
-                _write_png_chunk(stream, b"IDAT", data)
-        _write_png_chunk(stream, b"IDAT", compressor.flush())
-        _write_png_chunk(stream, b"IEND", b"")
+def _plain_png_mode(path: Path) -> str | None:
+    """Mode of a non-interlaced 8-bit L, RGB or RGBA PNG holding only IHDR,
+    IDAT and IEND chunks, which texconv decodes to the same pixels and
+    metadata as its ``save_cooker_png`` copy."""
+    try:
+        with current_filesystem().open(path, "rb") as stream:
+            header = stream.read(33)
+            if (
+                len(header) != 33
+                or header[:16] != _PNG_SIGNATURE_AND_IHDR
+                or header[24:29] not in _PLAIN_PNG_FORMATS
+            ):
+                return None
+            while chunk := stream.read(8):
+                if len(chunk) != 8:
+                    return None
+                kind = chunk[4:]
+                if kind == b"IEND":
+                    return _PLAIN_PNG_FORMATS[header[24:29]]
+                if kind != b"IDAT":
+                    return None
+                stream.seek(int.from_bytes(chunk[:4], "big") + 4, io.SEEK_CUR)
+    except OSError:
+        return None
+    return None
 
 
 def copy_textures(
@@ -983,7 +973,13 @@ def copy_textures(
         image: Image.Image | None = None
         needs_conversion = source.suffix.casefold() != ".dds"
         source_stem = slugify(source.stem)
-        if role == "color" or needs_conversion:
+        plain_png = (
+            needs_conversion
+            and source not in transparent_diffuse_sources
+            and _plain_png_mode(source)
+            in _PLAIN_PNG_ROLE_MODES.get(role, ("L", "RGB", "RGBA"))
+        )
+        if not plain_png and (role == "color" or needs_conversion):
             try:
                 with Image.open(filesystem.read_path(source)) as opened:
                     has_alpha = "A" in opened.getbands() or "transparency" in opened.info
@@ -1054,7 +1050,7 @@ def copy_textures(
         )
         output_source = (
             source.with_suffix(".png")
-            if output_image is not None
+            if output_image is not None or plain_png
             else source
         )
         name = texture_target_name(output_source, role)
@@ -1066,7 +1062,7 @@ def copy_textures(
         used_names.add(name.casefold())
         target = target_dir / name
         if output_image is not None:
-            _save_cooker_png(output_image, target)
+            save_cooker_png(output_image, target)
         elif srgb_dds is not None:
             filesystem.write_bytes(target, srgb_dds)
         else:
@@ -1077,7 +1073,7 @@ def copy_textures(
             if opacity_name.casefold() in used_names:
                 digest = digest or hashlib.sha1(str(source).casefold().encode("utf-8")).hexdigest()[:8]
                 opacity_name = f"{source_stem}_{digest}.opacity.data.png"
-            _save_cooker_png(alpha_image, target_dir / opacity_name)
+            save_cooker_png(alpha_image, target_dir / opacity_name)
             used_names.add(opacity_name.casefold())
             opacity_result[source] = OpacityTexture(
                 opacity_name,
@@ -1565,7 +1561,11 @@ def _write_statics(level_dir: Path, level_id: str, statics: list[StaticInstance]
                 "scale": instance.scale,
                 "shapeName": instance.shape_vfs,
                 "collisionType": instance.collision_type,
-                "decalType": instance.collision_type,
+                "decalType": (
+                    instance.collision_type
+                    if instance.decal_type is None
+                    else instance.decal_type
+                ),
                 "isRenderEnabled": instance.visible,
                 "useInstanceRenderData": True,
                 "originSort": True,
@@ -2091,6 +2091,7 @@ def _write_rally_stage(
         splits,
     )
     node_ids = list(range(100, 100 + len(path_points)))
+    segment_id_start = 100 + len(path_points)
     pathnodes = [
         {
             "customFields": {"values": {}, "names": {}, "tags": {}, "types": {}},
@@ -2102,7 +2103,7 @@ def _write_rally_stage(
             "pos": [float(value) for value in point.position],
             "radius": 8,
             "sidePadding": [1, 3],
-            "useAsSplit": point.use_as_split,
+            "useAsSplit": bool(point.use_as_split),
             "visible": True,
         }
         for index, (node_id, point) in enumerate(zip(node_ids, path_points))
@@ -2113,7 +2114,7 @@ def _write_rally_stage(
             "from": from_node,
             "mode": "waypoint",
             "name": f"Segment {index + 1}",
-            "oldId": 1000 + index,
+            "oldId": segment_id_start + index,
             "to": to_node,
         }
         for index, (from_node, to_node) in enumerate(zip(node_ids, node_ids[1:]))
@@ -2317,7 +2318,10 @@ def write_level(
     pacenote_visualizer_log: Callable[[str], None] | None = None,
     map_yaw_degrees: float = 0.0,
     cooked_textures: CookedTextures | None = None,
+    title_suffix: str | None = None,
 ) -> None:
+    if title_suffix is None:
+        title_suffix = "[RX]" if level_id.endswith("_rx") else ""
     filesystem = current_filesystem()
     level_dir = package_root / "levels" / level_id
     filesystem.mkdir(level_dir, parents=True, exist_ok=True)
@@ -2325,18 +2329,25 @@ def write_level(
     rally = stage.has_finish
     metadata = stage.metadata
     location = stage.location
-    title = _stage_title(metadata, location, display_environment)
+    title = _stage_title(
+        metadata,
+        location,
+        display_environment,
+        title_suffix=title_suffix,
+    )
     description = _stage_description(
         metadata,
         location,
         environment=display_environment,
         rally=rally,
+        title_suffix=title_suffix,
     )
     rally_title = _stage_title(
         metadata,
         location,
         display_environment,
         rally=True,
+        title_suffix=title_suffix,
     )
     if progress is not None:
         progress("Writing level metadata and previews")
@@ -2422,6 +2433,7 @@ def write_level(
             metadata,
             location,
             rally=rally,
+            title_suffix=title_suffix,
         )
 
     if progress is not None:
@@ -2762,12 +2774,34 @@ def validate_package(
         or any(not isinstance(node, dict) for node in pathnodes)
     ):
         raise ConversionError("Generated rally pathnodes are invalid")
+    if any(not isinstance(node.get("useAsSplit"), bool) for node in pathnodes):
+        raise ConversionError(
+            "Generated rally pathnodes must set useAsSplit explicitly"
+        )
+    segments = race.get("segments")
+    if (
+        not isinstance(segments, list)
+        or any(not isinstance(segment, dict) for segment in segments)
+    ):
+        raise ConversionError("Generated race segments are invalid")
+    race_pacenotes = race.get("pacenotes")
+    pacenote_items = race_pacenotes if isinstance(race_pacenotes, list) else []
+    race_ids: set[int] = set()
+    for value in (*start_positions, *pathnodes, *segments, *pacenote_items):
+        identifier = value.get("oldId") if isinstance(value, dict) else None
+        if (
+            isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or identifier in race_ids
+        ):
+            raise ConversionError("Generated race has duplicate or invalid IDs")
+        race_ids.add(identifier)
     node_ids = {node.get("oldId") for node in pathnodes}
     if race.get("startNode") not in node_ids or race.get("endNode") not in node_ids:
         raise ConversionError("Generated race has invalid start or end node references")
     if race.get("endNode") != pathnodes[-1].get("oldId"):
         raise ConversionError("Generated rally finish is not the last pathnode")
-    for segment in race.get("segments", []):
+    for segment in segments:
         if segment.get("from") not in node_ids or segment.get("to") not in node_ids:
             raise ConversionError(f"Generated race segment {segment.get('name')!r} references an unknown node")
 

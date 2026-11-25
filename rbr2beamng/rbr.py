@@ -383,6 +383,11 @@ def read_metadata(stage_root: Path) -> StageMetadata:
     if splash and not filesystem.is_file(splash):
         splash = None
     raw_length = get_value(section, "length", "")
+    country_code = (
+        get_value(section, "countrycode", "")
+        or get_value(section, "country_code", "")
+        or get_value(section, "country", "")
+    ).strip().upper()
     return StageMetadata(
         folder_name=stage_root.name,
         name=get_value(section, "name", stage_root.name),
@@ -393,6 +398,7 @@ def read_metadata(stage_root: Path) -> StageMetadata:
         comment=get_value(section, "comment", ""),
         length_km=parse_float(raw_length, field="stage length") if raw_length else None,
         splashscreen=splash,
+        country_code=country_code,
     )
 
 
@@ -917,6 +923,8 @@ def rsf_catalog_entries(catalog_path: Path) -> list[dict[str, object]]:
 
 
 def _catalog_country_code(stage_root: Path, metadata: StageMetadata) -> tuple[str, str]:
+    if metadata.country_code:
+        return metadata.country_code, ""
     filesystem = current_filesystem()
     catalog_path = stage_root.parents[2] / "rsfdata" / "cache" / "stages_data.json"
     if not filesystem.is_file(catalog_path):
@@ -924,6 +932,10 @@ def _catalog_country_code(stage_root: Path, metadata: StageMetadata) -> tuple[st
     entries = rsf_catalog_entries(filesystem.read_path(catalog_path))
     target = metadata.name.casefold()
     matches = [entry for entry in entries if str(entry.get("name", "")).casefold() == target]
+    if not matches:
+        base_target = re.sub(r"\s+[a-z]$", "", target)
+        if base_target != target:
+            matches = [entry for entry in entries if str(entry.get("name", "")).casefold() == base_target]
     if not matches:
         # stages missing from the list, like Te Parae Road 2021 R, are where their author's other stages are
         author = metadata.author.casefold()
@@ -947,7 +959,13 @@ def location_for_country_code(country_code: str) -> StageLocation:
     code = country_code.strip().upper()
     locations = _location_data()
     if code not in locations:
-        code = "EU"
+        name_lower = country_code.strip().casefold()
+        for c_code, c_data in locations.items():
+            if str(c_data.get("country", "")).casefold() == name_lower:
+                code = c_code
+                break
+        else:
+            code = "EU"
     country = locations[code]
     return StageLocation(
         country_code=code,

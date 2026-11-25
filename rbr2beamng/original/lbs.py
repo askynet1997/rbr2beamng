@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import os
+import struct
 import warnings
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +14,7 @@ from ..filesystem import current_filesystem
 from .binary import (
     BinaryReader,
     BinarySource,
+    BoundsError,
     FormatError,
     Source,
     checked_count,
@@ -925,6 +929,150 @@ def parse_lbs(source: Source) -> LbsFile:
     if encoded:
         _validate_ibs_geometry(result, loaded.name)
     return result
+
+
+def _scan_stream_sections(
+    path: Path,
+    wanted: frozenset[int],
+    *,
+    count_limit: int = 100_000,
+) -> list[tuple[int, int, memoryview]]:
+    context = f"LBS {path}"
+    found: list[tuple[int, int, memoryview]] = []
+    with current_filesystem().open(path, "rb") as stream:
+        stream.seek(0, io.SEEK_END)
+        file_size = stream.tell()
+        if file_size == 0:
+            return found
+        stream.seek(0)
+        encoded = stream.read(4) == _IBS_ENCODED_HEADER
+        stream.seek(0)
+        offset = 0
+        count = 0
+        while offset < file_size:
+            if file_size - offset < 16:
+                raise BoundsError(
+                    "Truncated segment header",
+                    offset=offset,
+                    context=context,
+                )
+            header = stream.read(16)
+            if len(header) != 16:
+                raise BoundsError(
+                    "Truncated segment header",
+                    offset=offset,
+                    context=context,
+                )
+            if encoded:
+                header = header.translate(_IBS_DECODE_TABLE)
+            header_size, _category, kind, payload_size = struct.unpack(
+                "<4I", header
+            )
+            if header_size != 8:
+                raise FormatError(
+                    f"Unexpected segment header size {header_size}; expected 8",
+                    offset=offset,
+                    context=context,
+                )
+            count += 1
+            checked_count(
+                count,
+                limit=count_limit,
+                offset=offset,
+                context="segment count",
+            )
+            segment_offset = offset
+            offset += 16
+            if payload_size > file_size - offset:
+                raise BoundsError(
+                    f"Segment payload size {payload_size} exceeds remaining "
+                    f"{file_size - offset} bytes",
+                    offset=offset,
+                    context=context,
+                )
+            if kind in wanted:
+                payload = stream.read(payload_size)
+                if len(payload) != payload_size:
+                    raise BoundsError(
+                        f"Truncated segment payload ({len(payload)} of "
+                        f"{payload_size} bytes)",
+                        offset=offset,
+                        context=context,
+                    )
+                if encoded:
+                    payload = payload.translate(_IBS_DECODE_TABLE)
+                found.append((segment_offset, kind, memoryview(payload)))
+            else:
+                stream.seek(payload_size, io.SEEK_CUR)
+            offset += payload_size
+    return found
+
+
+def parse_lbs_sections(source: Source, sections: Collection[int]) -> LbsFile:
+    """Parse only the requested LBS sections, seeking past skipped payloads."""
+    wanted = frozenset(sections) & _LBS_KNOWN_SECTIONS
+    if isinstance(source, (str, os.PathLike)):
+        path = Path(source)
+        entries = _scan_stream_sections(path, wanted)
+        companion = path.with_suffix(".lb2")
+        if current_filesystem().is_file(companion):
+            entries.extend(_scan_stream_sections(companion, wanted))
+        raw = memoryview(b"")
+    else:
+        loaded, _, segments = _lbs_segments(source)
+        entries = [
+            (segment.offset, segment.kind, segment.payload)
+            for segment in segments
+            if segment.kind in wanted
+        ]
+        raw = loaded.view
+
+    world_bounds = None
+    geom_blocks = None
+    object_blocks = None
+    car_location = None
+    groups: dict[int, tuple[ObjectData3DGroup, ...]] = {}
+    trailing: dict[int, memoryview] = {}
+    seen: set[int] = set()
+    for offset, kind, payload in entries:
+        if kind in seen:
+            raise FormatError(
+                f"Duplicate LBS section 0x{kind:x}",
+                offset=offset,
+                context="LBS segment",
+            )
+        seen.add(kind)
+        if kind == GEOM_BLOCKS:
+            geom_blocks = parse_geom_blocks(payload)
+            remainder = geom_blocks.trailing
+        elif kind == OBJECT_BLOCKS:
+            object_blocks, remainder = parse_object_blocks(payload)
+        elif kind == CAR_LOCATION:
+            car_location, remainder = parse_car_location(payload)
+        elif kind == VISIBLE_OBJECTS:
+            world_bounds, remainder = _parse_world_bounds(payload)
+        else:
+            reader = BinaryReader(
+                payload,
+                context=f"LBS ObjectData3D section 0x{kind:x}",
+            )
+            if kind == SUPER_BOWL:
+                groups[kind] = _parse_super_bowl(reader)
+            else:
+                groups[kind] = _parse_data_3d_groups(reader, kind)
+            remainder = reader.remaining_view()
+        if remainder:
+            trailing[kind] = remainder
+    return LbsFile(
+        segments=(),
+        world_bounds=world_bounds,
+        geom_blocks=geom_blocks,
+        object_blocks=object_blocks,
+        car_location=car_location,
+        object_data_groups=groups,
+        section_trailing=trailing,
+        raw=raw,
+    )
 
 
 def parse_lbs_pacenote_inputs(source: Source) -> LbsFile:

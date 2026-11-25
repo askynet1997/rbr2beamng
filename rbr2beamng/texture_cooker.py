@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import platform
+import struct
 import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 from PIL import Image
+from zlib_ng import zlib_ng
 
 from .core import ConversionError
 from .filesystem import current_filesystem
@@ -16,10 +19,60 @@ from .profiling import profile_span
 
 TextureProgress = Callable[[int, int, Path], None]
 CookedTextures = dict[tuple[tuple[str, ...], bytes], Path]
+# PNG colour types of L, RGB and RGBA pixels, by band count.
+_PNG_COLOR_TYPES = {1: 0, 3: 2, 4: 6}
+_PNG_BAND_ROWS = 64
 
 
 def cooked_texture_path(source: Path) -> Path:
     return source.with_suffix(".dds")
+
+
+def _write_png_chunk(stream, kind: bytes, data: bytes) -> None:
+    stream.write(struct.pack(">I", len(data)) + kind)
+    stream.write(data)
+    stream.write(struct.pack(">I", zlib_ng.crc32(data, zlib_ng.crc32(kind))))
+
+
+def save_cooker_png(image: Image.Image | np.ndarray, target: Path) -> None:
+    """Save the chunks Pillow writes at compress_level=0, with unfiltered rows.
+
+    ``image`` is a Pillow image or a uint8 array of L, RGB or RGBA pixels.
+    Pillow still picks a filter for every row without compression, and
+    texconv decodes the same pixels either way.
+    """
+    filesystem = current_filesystem()
+    if isinstance(image, Image.Image):
+        if (
+            image.mode not in ("L", "RGB", "RGBA")
+            or image.info.get("icc_profile")
+            or image.info.get("transparency") is not None
+        ):
+            image.save(filesystem.write_path(target), format="PNG", compress_level=0)
+            return
+        pixels = np.asarray(image)
+    else:
+        pixels = image
+    height, width = pixels.shape[:2]
+    bands = 1 if pixels.ndim == 2 else pixels.shape[2]
+    color_type = _PNG_COLOR_TYPES[bands]
+    rows = np.zeros((_PNG_BAND_ROWS, width * bands + 1), dtype=np.uint8)
+    compressor = zlib_ng.compressobj(0)
+    with filesystem.open(target, "wb") as stream:
+        stream.write(b"\x89PNG\r\n\x1a\n")
+        _write_png_chunk(
+            stream,
+            b"IHDR",
+            struct.pack(">2I5B", width, height, 8, color_type, 0, 0, 0),
+        )
+        for start in range(0, height, _PNG_BAND_ROWS):
+            end = min(start + _PNG_BAND_ROWS, height)
+            band = rows[: end - start]
+            band[:, 1:] = pixels[start:end].reshape(len(band), -1)
+            if data := compressor.compress(band):
+                _write_png_chunk(stream, b"IDAT", data)
+        _write_png_chunk(stream, b"IDAT", compressor.flush())
+        _write_png_chunk(stream, b"IEND", b"")
 
 
 def _executable_path() -> Path:

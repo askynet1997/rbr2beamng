@@ -135,7 +135,16 @@ class _TreeParser:
                 context="COL collision tree",
             )
         values = _NODE_HEADER.unpack_from(self.data, offset)
-        require_finite(values[:6], offset=offset, context="COL tree bounds")
+        # A sum of six float32 values cannot overflow a double, so it is finite
+        # exactly when all of them are.
+        if not math.isfinite(
+            values[0] + values[1] + values[2] + values[3] + values[4] + values[5]
+        ):
+            raise FormatError(
+                "Non-finite floating-point value",
+                offset=offset,
+                context="COL tree bounds",
+            )
         if values[3] < 0 or values[4] < 0 or values[5] < 0:
             raise FormatError(
                 "Negative COL tree half extent",

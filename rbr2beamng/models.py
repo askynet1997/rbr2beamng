@@ -60,6 +60,7 @@ class StageMetadata:
     surface_composition: tuple[tuple[str, float], ...] = ()
     author_website: str = ""
     author_note: str = ""
+    country_code: str = ""
 
     @property
     def surface_composition_text(self) -> str:

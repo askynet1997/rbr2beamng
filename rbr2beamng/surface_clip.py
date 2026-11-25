@@ -593,6 +593,27 @@ def triangulate(polygon: Sequence[Vertex]) -> list[tuple[Vertex, Vertex, Vertex]
     return result
 
 
+def repeats_vertex_fields(polygon: Sequence[Vertex], fields: Sequence[int]) -> bool:
+    """Whether two vertices ``triangulate`` keeps agree on every one of
+    ``fields``, which must include the first two.
+
+    If not, which vertices form each of its triangles depends only on
+    ``fields``: it compares whole vertices just to tell them apart, and only
+    when it keeps more than three.
+    """
+    if (
+        len(polygon) <= 3
+        or len({vertex[0] for vertex in polygon}) == len(polygon)
+        or len({vertex[:2] for vertex in polygon}) == len(polygon)
+    ):
+        return False
+    kept = [
+        tuple(vertex[field] for field in fields)
+        for vertex in _without_repeated_vertices(polygon)
+    ]
+    return len(set(kept)) != len(kept)
+
+
 def _without_repeated_vertices(polygon: Sequence[Vertex]) -> list[Vertex]:
     result: list[Vertex] = []
     for vertex in polygon:

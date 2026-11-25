@@ -47,6 +47,7 @@ from .geometry import (
     extract_thin_wall_templates,
     inflate_thin_wall_templates,
     lod_detail_size,
+    partition_collision_parts,
     remap_mesh_part,
     source_position_to_beamng,
 )
@@ -214,10 +215,16 @@ def _payload_resolver(
     return None
 
 
+_UNSET = object()
+
+
 def _texture_lookup(
     files: OriginalStageFiles,
     catalog: OriginalCatalog,
     cache: dict[Path, TextureResolver],
+    *,
+    stock_map: object = _UNSET,
+    remap00: object = _UNSET,
 ) -> OriginalTextureLookup:
     texture_ini = files.files["texture_ini"]
     stage_id = files.entry.stage_id
@@ -240,21 +247,33 @@ def _texture_lookup(
     remap_path = _case_insensitive_path(
         files.entry.track_base.with_name(f"TextureFilenameMap{stage_id}.ini")
     )
-    if remap_path is None and 10 <= stage_id <= 99:
+    if remap_path is not None:
+        rsf_remap = parse_texture_remap(remap_path)
+    elif 10 <= stage_id <= 99:
         # RSF gives the stock stages without a map of their own its banners.
-        remap_path = _case_insensitive_path(
-            catalog.maps_root / "TextureFilenameMap00.ini"
+        if remap00 is _UNSET:
+            remap00_path = _case_insensitive_path(
+                catalog.maps_root / "TextureFilenameMap00.ini"
+            )
+            rsf_remap = parse_texture_remap(remap00_path) if remap00_path else None
+        else:
+            rsf_remap = remap00
+    else:
+        rsf_remap = None
+    if stock_map is _UNSET:
+        stock_path = _case_insensitive_path(
+            catalog.maps_root / "TextureFilenameMap.dat"
         )
-    stock_path = _case_insensitive_path(
-        catalog.maps_root / "TextureFilenameMap.dat"
-    )
+        resolved_stock_map = (
+            parse_texture_filename_map_file(stock_path) if stock_path else None
+        )
+    else:
+        resolved_stock_map = stock_map
     return OriginalTextureLookup(
         texture_ini.stem,
         payload,
-        rsf_remap=parse_texture_remap(remap_path) if remap_path else None,
-        stock_map=(
-            parse_texture_filename_map_file(stock_path) if stock_path else None
-        ),
+        rsf_remap=rsf_remap,
+        stock_map=resolved_stock_map,
     )
 
 
@@ -922,6 +941,7 @@ def _write_static_shape(
     *,
     dynamic: bool = False,
     collision_only: bool = False,
+    decal_type: str | None = None,
     null_detail_sizes: tuple[int, ...] = (),
     progress: Callable[[str], None] | None = None,
     collision_compaction_cache: dict[bytes, MeshPart | None] | None = None,
@@ -964,6 +984,7 @@ def _write_static_shape(
             visible=True,
             collision_type="Collision Mesh" if collision_only else "None",
             dynamic=dynamic or collision_only,
+            decal_type=decal_type,
         )
     )
     return collision_triangles
@@ -1758,13 +1779,6 @@ def _convert_original(
                 collision_triangles = 0
                 if collision_parts:
                     original_progress("Writing Original RBR collision shape")
-                    collision_shape_name = (
-                        f"original_collision_{version_suffix}.dae"
-                    )
-                    collision_archive_name = (
-                        f"levels/{level_id}/art/shapes/"
-                        f"{collision_shape_name}"
-                    )
                     with profile_span(
                         "write_collision",
                         category="collada",
@@ -1775,53 +1789,99 @@ def _convert_original(
                             for part in collision_parts
                         ),
                     ) as collision_span:
-                        collision_triangles = _write_static_shape(
-                            shape_archive,
-                            archived_paths,
-                            statics,
-                            collision_archive_name,
-                            "original_collision",
-                            collision_parts,
-                            [0.0, 0.0, 0.0],
-                            identity_rotation,
-                            collision_only=True,
-                            progress=original_progress,
-                            collision_compaction_cache=(
-                                collision_compaction_cache
-                            ),
-                            shared_collision_shapes=shared_collision_shapes,
+                        collision_chunks = partition_collision_parts(
+                            collision_parts
                         )
+                        single_chunk = len(collision_chunks) == 1
+                        for chunk_index, (
+                            chunk_position,
+                            chunk_parts,
+                        ) in enumerate(collision_chunks, 1):
+                            if not single_chunk and (
+                                chunk_index == 1
+                                or chunk_index % 50 == 0
+                                or chunk_index == len(collision_chunks)
+                            ):
+                                original_progress(
+                                    "Writing Original RBR collision shapes: "
+                                    f"{chunk_index:,}/{len(collision_chunks):,}"
+                                )
+                            suffix = (
+                                ""
+                                if single_chunk
+                                else f"_{chunk_index - 1:04d}"
+                            )
+                            collision_shape_name = (
+                                f"original_collision{suffix}_"
+                                f"{version_suffix}.dae"
+                            )
+                            collision_archive_name = (
+                                f"levels/{level_id}/art/shapes/"
+                                f"{collision_shape_name}"
+                            )
+                            collision_triangles += _write_static_shape(
+                                shape_archive,
+                                archived_paths,
+                                statics,
+                                collision_archive_name,
+                                f"original_collision{suffix}",
+                                chunk_parts,
+                                chunk_position,
+                                identity_rotation,
+                                collision_only=True,
+                                progress=(
+                                    original_progress if single_chunk else None
+                                ),
+                                collision_compaction_cache=(
+                                    collision_compaction_cache
+                                ),
+                                shared_collision_shapes=shared_collision_shapes,
+                            )
                         collision_span.update(
+                            chunks=len(collision_chunks),
                             collisionTriangles=collision_triangles,
                         )
                 if brake_wall_part is not None:
                     original_progress("Writing Original RBR map-border brake wall")
-                    brake_shape_name = (
-                        f"original_map_border_brake_wall_"
-                        f"{version_suffix}.dae"
-                    )
-                    brake_archive_name = (
-                        f"levels/{level_id}/art/shapes/"
-                        f"{brake_shape_name}"
-                    )
                     with profile_span(
                         "write_map_border_brake_wall",
                         category="collada",
                         tint=tint,
                         faces=len(brake_wall_part.faces),
                     ):
-                        brake_collision_triangles = _write_static_shape(
-                            shape_archive,
-                            archived_paths,
-                            statics,
-                            brake_archive_name,
-                            "original_map_border_brake_wall",
-                            [brake_wall_part],
-                            [0.0, 0.0, 0.0],
-                            identity_rotation,
-                            collision_only=True,
+                        brake_chunks = partition_collision_parts(
+                            [brake_wall_part]
                         )
-                    collision_triangles += brake_collision_triangles
+                        single_brake_chunk = len(brake_chunks) == 1
+                        for chunk_index, (
+                            chunk_position,
+                            chunk_parts,
+                        ) in enumerate(brake_chunks):
+                            suffix = (
+                                ""
+                                if single_brake_chunk
+                                else f"_{chunk_index:04d}"
+                            )
+                            brake_shape_name = (
+                                f"original_map_border_brake_wall{suffix}_"
+                                f"{version_suffix}.dae"
+                            )
+                            brake_archive_name = (
+                                f"levels/{level_id}/art/shapes/"
+                                f"{brake_shape_name}"
+                            )
+                            collision_triangles += _write_static_shape(
+                                shape_archive,
+                                archived_paths,
+                                statics,
+                                brake_archive_name,
+                                f"original_map_border_brake_wall{suffix}",
+                                chunk_parts,
+                                chunk_position,
+                                identity_rotation,
+                                collision_only=True,
+                                decal_type="None",
+                            )
                 plugin_stats = plugins.write_level(
                     PluginLevel(
                         archive=shape_archive,

@@ -953,7 +953,11 @@ def _pacenote_warning(
     message: str,
     note: Pacenote,
     definition: NoteDefinition | None,
+    reason: str = "",
 ) -> str:
+    details = f"{message} {_diagnostic_details(note.note_type, definition, [note])}"
+    if reason:
+        return f"{PACENOTE_WARNING_PREFIX}{details}; {reason}"
     return (
         f"{PACENOTE_WARNING_PREFIX}{message}; "
         f"{_diagnostic_details(note.note_type, definition, [note])}"
@@ -3551,7 +3555,7 @@ def build_rally_notebook(
         )
     if dropped_modifiers:
         warnings.extend(
-            _pacenote_failure(
+            _pacenote_warning(
                 f"Unable to convert RBR modifier {modifier}",
                 note,
                 catalog.definitions[note_id],

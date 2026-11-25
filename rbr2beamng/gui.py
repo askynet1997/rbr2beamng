@@ -61,7 +61,12 @@ from .original.source import (
     primary_original_tint,
 )
 from .pdf_viewer import PdfError, PdfViewer, pdf_text
-from .plugins import CompanionMod, companion_mods
+from .plugins import (
+    CompanionMod,
+    companion_mods,
+    scan_stage_indicators,
+    stage_indicators,
+)
 from .rbr import (
     PLAIN_TEXT_DOCUMENT_SUFFIXES,
     country_locations,
@@ -665,6 +670,7 @@ def _stage_is_installed(
     *,
     display_name: str = "",
     source_format: str = "rx",
+    rbr_root: Path | None = None,
 ) -> bool:
     if not beamng_mods_dir.strip():
         return False
@@ -675,6 +681,7 @@ def _stage_is_installed(
                 folder_name,
                 display_name=display_name,
                 source_format=source_format,
+                rbr_root=rbr_root,
             )
         )
     except OSError:
@@ -881,11 +888,31 @@ def _stage_display_values(stage) -> tuple[str, ...]:
     )
 
 
-def _stage_matches_search(stage, search: str) -> bool:
+def _format_stage_name(
+    name: str,
+    *,
+    installed: bool = False,
+    indicators: Iterable[str] = (),
+) -> str:
+    prefix = "✓ " if installed else ""
+    suffix = " ".join(symbol for symbol in indicators if symbol)
+    return f"{prefix}{name} {suffix}" if suffix else f"{prefix}{name}"
+
+
+def _stage_matches_search(
+    stage,
+    search: str,
+    *,
+    indicators: Iterable[str] = (),
+) -> bool:
     query = search.strip().casefold()
     return not query or any(
         query in value.casefold()
-        for value in (*_stage_display_values(stage), *_stage_legal_terms(stage))
+        for value in (
+            *_stage_display_values(stage),
+            *_stage_legal_terms(stage),
+            *indicators,
+        )
     )
 
 
@@ -1686,6 +1713,15 @@ class ConverterApp:
         self.stage_preload_thread: threading.Thread | None = None
         self.stage_preload_worker_lock = threading.Lock()
         self._stage_preload_active_generation: int | None = None
+        self.stage_indicator_order = tuple(
+            indicator.symbol for indicator in stage_indicators()
+        )
+        self.stage_indicators: dict[str, set[str]] = {}
+        self.stage_indicator_generation = 0
+        self.stage_indicator_cancel = threading.Event()
+        self.stage_indicator_thread: threading.Thread | None = None
+        self.stage_indicator_worker_lock = threading.Lock()
+        self.stage_indicators_complete = False
         self.process: subprocess.Popen[str] | None = None
         self.conversion_active = False
         self.pacenote_preview_active = False
@@ -1826,9 +1862,10 @@ class ConverterApp:
         self.root.bind("<Control-F>", self._focus_stage_search)
         column = 3
         for mod in companion_mods():
+            prefix = f"{mod.indicator} " if mod.indicator else ""
             ttk.Button(
                 search,
-                text=f"Install 'RBR {mod.title}' mod",
+                text=f"{prefix}Install 'RBR {mod.title}' mod",
                 style="Action.TButton",
                 command=lambda mod=mod: self._install_companion_mod(mod),
             ).grid(row=0, column=column, sticky=tk.E, padx=(8, 0))
@@ -3559,6 +3596,8 @@ class ConverterApp:
     def _refresh_stages(self) -> None:
         self._cancel_stage_preload()
         self.inspected_original_stage_keys.clear()
+        self.stage_indicators.clear()
+        self.stage_indicators_complete = False
         self.pending_current_conversion_key = None
         self.pending_batch_conversion_keys.clear()
         try:
@@ -3585,6 +3624,84 @@ class ConverterApp:
         self.stage_preload_cancel = threading.Event()
         self.stage_preload_requests = queue.Queue()
         self._stage_preload_active_generation = None
+        self._cancel_stage_indicator_scan()
+
+    def _cancel_stage_indicator_scan(self) -> None:
+        if hasattr(self, "stage_indicator_generation"):
+            self.stage_indicator_generation += 1
+        cancel = getattr(self, "stage_indicator_cancel", None)
+        if cancel is not None:
+            cancel.set()
+            self.stage_indicator_cancel = threading.Event()
+
+    def _start_stage_indicator_scan(self) -> None:
+        if (
+            not getattr(self, "stage_indicator_order", ())
+            or not getattr(self, "rbr_path", None)
+            or not self.rbr_path.get().strip()
+            or not getattr(self, "stages", ())
+            or getattr(self, "conversion_active", False)
+            or getattr(self, "stage_indicators_complete", False)
+        ):
+            return
+        self._cancel_stage_indicator_scan()
+        generation = self.stage_indicator_generation
+        rbr_root = Path(self.rbr_path.get()).expanduser()
+        thread = threading.Thread(
+            target=self._scan_stage_indicators,
+            args=(
+                generation,
+                rbr_root,
+                tuple(self.stages),
+                self.stage_indicator_cancel,
+            ),
+            daemon=True,
+        )
+        self.stage_indicator_thread = thread
+        thread.start()
+
+    def _resume_stage_indicator_scan(self) -> None:
+        if (
+            not getattr(self, "stage_indicators_complete", True)
+            and not getattr(self, "conversion_active", False)
+            and getattr(self, "_stage_preload_active_generation", None) is None
+        ):
+            self._start_stage_indicator_scan()
+
+    def _scan_stage_indicators(
+        self,
+        generation: int,
+        rbr_root: Path,
+        stages,
+        cancelled: threading.Event,
+    ) -> None:
+        completed = False
+        try:
+            with self.stage_indicator_worker_lock:
+                if cancelled.is_set():
+                    return
+                filesystem = create_runtime_filesystem(
+                    rbr_root=rbr_root,
+                    include_runtime_write_roots=True,
+                )
+                with use_filesystem(filesystem):
+                    for source_key, indicator in scan_stage_indicators(
+                        rbr_root, stages, cancelled
+                    ):
+                        if cancelled.is_set():
+                            return
+                        self.events.put(
+                            (
+                                "stage_indicator_found",
+                                (generation, source_key, indicator.symbol),
+                            )
+                        )
+                completed = not cancelled.is_set()
+        except Exception:
+            completed = False
+        finally:
+            if completed:
+                self.events.put(("stage_indicators_finished", generation))
 
     def _schedule_stage_preload(self) -> None:
         generation = self.stage_preload_generation
@@ -3768,6 +3885,70 @@ class ConverterApp:
                 tone="normal",
             )
         self._update_convert_state()
+        self._start_stage_indicator_scan()
+
+    def _stage_indicator_symbols(self, stage) -> tuple[str, ...]:
+        indicators = getattr(self, "stage_indicators", None)
+        if not indicators:
+            return ()
+        found = indicators.get(stage.source_key)
+        if not found:
+            return ()
+        order = getattr(self, "stage_indicator_order", ())
+        ordered = [symbol for symbol in order if symbol in found]
+        extras = sorted(found - set(order))
+        return tuple((*ordered, *extras))
+
+    def _stage_name_cell_text(
+        self,
+        stage,
+        *,
+        installed: bool | None = None,
+    ) -> str:
+        if installed is None:
+            rbr_path = getattr(self, "rbr_path", None) and self.rbr_path.get().strip()
+            rbr_root = Path(rbr_path) if rbr_path else None
+            installed = _stage_is_installed(
+                self.beamng_mods_dir.get(),
+                stage.metadata.folder_name,
+                self.filesystem,
+                display_name=stage.metadata.name,
+                source_format=stage.source_format,
+                rbr_root=rbr_root,
+            )
+        return _format_stage_name(
+            stage.metadata.name,
+            installed=installed,
+            indicators=self._stage_indicator_symbols(stage),
+        )
+
+    def _handle_stage_indicator_found(self, payload) -> None:
+        generation, source_key, symbol = payload
+        if generation != getattr(self, "stage_indicator_generation", 0):
+            return
+        found = self.stage_indicators.setdefault(source_key, set())
+        if symbol in found:
+            return
+        found.add(symbol)
+        stage = next(
+            (candidate for candidate in self.stages if candidate.source_key == source_key),
+            None,
+        )
+        if stage is None:
+            return
+        item = stage.metadata.folder_name
+        if self.tree.exists(item):
+            self.tree.set(item, "name", self._stage_name_cell_text(stage))
+        elif self.stage_search.get().strip() and _stage_matches_search(
+            stage,
+            self.stage_search.get(),
+            indicators=self._stage_indicator_symbols(stage),
+        ):
+            self._populate_tree()
+
+    def _handle_stage_indicators_finished(self, generation: int) -> None:
+        if generation == getattr(self, "stage_indicator_generation", 0):
+            self.stage_indicators_complete = True
 
     def _request_stage_preload(self, stage) -> bool:
         if self._stage_preload_ready(stage):
@@ -3805,14 +3986,7 @@ class ConverterApp:
             _checkbox_text(stage.metadata.folder_name in self.selected_stage_keys)
         ]
         values.extend(_stage_display_values(stage))
-        if _stage_is_installed(
-            self.beamng_mods_dir.get(),
-            stage.metadata.folder_name,
-            self.filesystem,
-            display_name=stage.metadata.name,
-            source_format=stage.source_format,
-        ):
-            values[5] = f"✓ {values[5]}"
+        values[5] = self._stage_name_cell_text(stage)
         return values
 
     def _replace_stage(self, inspected_stage) -> None:
@@ -3837,7 +4011,11 @@ class ConverterApp:
         self.surface_markers.clear()
         self.tree.delete(*self.tree.get_children())
         for stage in self.stages:
-            if not _stage_matches_search(stage, self.stage_search.get()):
+            if not _stage_matches_search(
+                stage,
+                self.stage_search.get(),
+                indicators=self._stage_indicator_symbols(stage),
+            ):
                 continue
             item = self.tree.insert(
                 "",
@@ -3999,22 +4177,25 @@ class ConverterApp:
 
     def _refresh_installed_markers(self) -> None:
         mods_dir = self.beamng_mods_dir.get()
+        rbr_path = getattr(self, "rbr_path", None) and self.rbr_path.get().strip()
+        rbr_root = Path(rbr_path) if rbr_path else None
         for stage in self.stages:
             item = stage.metadata.folder_name
             if not self.tree.exists(item):
                 continue
-            prefix = (
-                "✓ "
-                if _stage_is_installed(
-                    mods_dir,
-                    item,
-                    self.filesystem,
-                    display_name=stage.metadata.name,
-                    source_format=stage.source_format,
-                )
-                else ""
+            installed = _stage_is_installed(
+                mods_dir,
+                item,
+                self.filesystem,
+                display_name=stage.metadata.name,
+                source_format=stage.source_format,
+                rbr_root=rbr_root,
             )
-            self.tree.set(item, "name", prefix + stage.metadata.name)
+            self.tree.set(
+                item,
+                "name",
+                self._stage_name_cell_text(stage, installed=installed),
+            )
 
     def _sort_tree(self, column: str) -> None:
         if self.sort_column == column:
@@ -5849,12 +6030,15 @@ class ConverterApp:
 
     def _destination(self, stage) -> Path:
         mods_dir = Path(self.beamng_mods_dir.get())
+        rbr_path = getattr(self, "rbr_path", None) and self.rbr_path.get().strip()
+        rbr_root = Path(rbr_path) if rbr_path else None
         return self.filesystem.write_path(
             mods_dir
             / stage_zip_name(
                 stage.metadata.folder_name,
                 display_name=stage.metadata.name,
                 source_format=stage.source_format,
+                rbr_root=rbr_root,
             )
         )
 
@@ -6411,6 +6595,10 @@ class ConverterApp:
                     self._handle_stage_preload_processed(payload)
                 elif kind == "stage_preload_finished":
                     self._finish_stage_preload_progress(int(payload))
+                elif kind == "stage_indicator_found":
+                    self._handle_stage_indicator_found(payload)
+                elif kind == "stage_indicators_finished":
+                    self._handle_stage_indicators_finished(int(payload))
                 elif kind == "pacenote_preview_finished":
                     self._finish_pacenote_preview(payload)
                 elif kind == "pacenote_preview_error":
@@ -6512,6 +6700,7 @@ class ConverterApp:
                         parent=self.root,
                     )
                 self._update_convert_state()
+                self._resume_stage_indicator_scan()
                 return
             messagebox.showinfo(_title("Conversion complete"), summary, parent=self.root)
         elif return_code == 130 or cancelled:
@@ -6559,6 +6748,7 @@ class ConverterApp:
                     parent=self.root,
                 )
                 self._update_convert_state()
+                self._resume_stage_indicator_scan()
                 return
             self.progress.set(
                 value=100,
@@ -6573,6 +6763,7 @@ class ConverterApp:
                 f"{format_duration(elapsed)}. Review the log for details.",
                 parent=self.root,
             )
+        self._resume_stage_indicator_scan()
 
     def _clear_conversion_state(self) -> None:
         self.process = None

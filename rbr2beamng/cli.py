@@ -27,6 +27,7 @@ from .core import (
     format_file_size,
     settings_path,
     slugify,
+    stage_level_id,
     stage_zip_name,
     temporary_root,
 )
@@ -757,6 +758,7 @@ def _pacenote_visualizer(args: argparse.Namespace) -> int:
                     inspection.metadata.folder_name,
                     display_name=inspection.metadata.name,
                     source_format="original",
+                    rbr_root=rbr_root,
                 )
             ).stem
             stages = [
@@ -774,7 +776,13 @@ def _pacenote_visualizer(args: argparse.Namespace) -> int:
             )
             stages = [stage]
             map_yaws = [0.0]
-            output_stems = [f"rbr_{slugify(stage.metadata.folder_name)}"]
+            output_stems = [
+                stage_level_id(
+                    stage.metadata.folder_name,
+                    source_format="rx",
+                    rbr_root=rbr_root,
+                )
+            ]
         for stage, map_yaw, output_stem in zip(stages, map_yaws, output_stems):
             output = output_dir / f"{output_stem}.html"
             html = render_stage_pacenote_visualizer(

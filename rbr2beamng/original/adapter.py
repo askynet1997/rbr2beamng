@@ -7,6 +7,7 @@ import shutil
 import warnings
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
+from operator import itemgetter
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Callable, Hashable, Iterable, Mapping, Sequence
@@ -46,6 +47,7 @@ from ..surface_clip import (
     decompose_regions,
     merge_fragments,
     polygon_area,
+    repeats_vertex_fields,
     triangle_cost,
     triangulate,
 )
@@ -1489,6 +1491,10 @@ def _cache_collision_template(
 # the triangle, so all of them survive clipping.
 _BLEND_FIELD = 3
 _SIDE_FIELDS = {1: (4, 5), 2: (6, 7)}
+_SIDE_OWN_FIELDS = {1: (0, 1, 2, _BLEND_FIELD, 4, 5), 2: (0, 1, 2, _BLEND_FIELD, 6, 7)}
+# The _collision_template_keys columns one blend side's template reads, unless
+# side 2's map has a passthrough cell: its material, selectors and blending.
+_SIDE_KEY_COLUMNS = {1: itemgetter(0, 2, 3, 4, 8), 2: itemgetter(1, 5, 6, 7, 8)}
 _MAP_CELLS = SELECTOR_MAP_CELLS
 # NGP 7.5 gives a contact whose second blend side reads this undefined ID the
 # first side's ID ("Passthrough"). On the first side it stays undefined.
@@ -1595,21 +1601,28 @@ def _triangulate_collision_polygon(
 
 def _build_all_conditions_collision_template(
     key: Sequence[int],
+    side: int,
     profile_regions: Mapping[int, tuple[Region, ...]],
     missing_map_regions: tuple[Region, ...],
-) -> tuple[np.ndarray, tuple[tuple[int, ...], ...]]:
-    """Subdivide COL geometry without using any MAT condition's values.
+    *,
+    triangle: tuple[Vertex, ...] | None = None,
+    check_other_side: bool = False,
+) -> tuple[tuple[float, ...], tuple[tuple[int, ...], ...], bool]:
+    """Subdivide one blend side of COL geometry without using any MAT
+    condition's values.
 
-    Returns the barycentric weights of each generated triangle, shaped
-    ``(n, 3, 3)``, and each triangle's surface vector.
+    ``triangle`` is the key's ``_collision_clip_triangle``, if already made.
+    Returns the barycentric weights of each generated triangle's corners,
+    flattened, each triangle's surface vector, and, with ``check_other_side``,
+    whether the other side's selectors could change them.
     """
-    triangle = _collision_clip_triangle(key)
-    weights: list[list[Vertex]] = []
+    if triangle is None:
+        triangle = _collision_clip_triangle(key)
+    weights: list[float] = []
     vectors: list[tuple[int, ...]] = []
-    for side, keep_above in ((1, False), (2, True)):
-        polygon = clip_polygon(triangle, _BLEND_FIELD, 15.5, keep_above)
-        if polygon_area(polygon) <= AREA_EPSILON:
-            continue
+    ambiguous = False
+    polygon = clip_polygon(triangle, _BLEND_FIELD, 15.5, side == 2)
+    if polygon_area(polygon) > AREA_EPSILON:
         regions = profile_regions.get(key[side - 1], missing_map_regions)
         fragments = _clip_polygon_to_regions(polygon, regions, side)
         if side == 2:
@@ -1618,13 +1631,13 @@ def _build_all_conditions_collision_template(
                 profile_regions.get(key[0], missing_map_regions),
             )
         for vector, clipped in fragments:
+            if check_other_side:
+                ambiguous |= repeats_vertex_fields(clipped, _SIDE_OWN_FIELDS[side])
             for corners in triangulate(clipped):
                 vectors.append(vector)
-                weights.append([corner[:3] for corner in corners])
-    return (
-        np.asarray(weights, dtype=np.float64).reshape((-1, 3, 3)),
-        tuple(vectors),
-    )
+                for corner in corners:
+                    weights.extend(corner[:3])
+    return tuple(weights), tuple(vectors), ambiguous
 
 
 def _all_conditions_passthrough(
@@ -2050,11 +2063,83 @@ def adapt_col_collision_all_conditions(
     template_cache: OrderedDict[
         tuple[int, ...], tuple[np.ndarray, np.ndarray]
     ] = OrderedDict()
+    # Per blend side and side key: that side's weights and surface vectors, the
+    # template key they were built for, and whether they also hold for keys
+    # with other selectors outside the side key (None: they do not, False:
+    # not checked yet).
+    side_caches: dict[
+        int,
+        OrderedDict[
+            tuple[int, ...],
+            tuple[
+                tuple[float, ...],
+                tuple[tuple[int, ...], ...],
+                tuple[int, ...],
+                bool | None,
+            ],
+        ],
+    ] = {1: OrderedDict(), 2: OrderedDict()}
+    passthrough_maps: dict[int, bool] = {}
     vector_ids: dict[tuple[int, ...], int] = {}
     triangles_by_vector: dict[int, list[np.ndarray]] = {}
     source_triangle_count = 0
     generated_triangle_count = 0
     subdivided_triangle_count = 0
+
+    def reads_passthrough(map_id: int) -> bool:
+        result = passthrough_maps.get(map_id)
+        if result is None:
+            result = passthrough_maps[map_id] = any(
+                _PASSTHROUGH_SURFACE_ID in region.value
+                for region in profile_regions.get(map_id, missing_map_regions)
+            )
+        return result
+
+    def side_template(
+        key: tuple[int, ...],
+        side: int,
+        triangle: tuple[Vertex, ...],
+    ) -> tuple[tuple[float, ...], tuple[tuple[int, ...], ...]]:
+        complete = side == 2 and reads_passthrough(key[1])
+        side_key = key if complete else _SIDE_KEY_COLUMNS[side](key)
+        cache = side_caches[side]
+        cached = cache.get(side_key)
+        if cached is None:
+            weights, vectors, _ambiguous = _build_all_conditions_collision_template(
+                key,
+                side,
+                profile_regions,
+                missing_map_regions,
+                triangle=triangle,
+            )
+            cache[side_key] = (weights, vectors, key, complete)
+            if len(cache) > _COLLISION_TEMPLATE_CACHE_LIMIT:
+                cache.popitem(last=False)
+            return weights, vectors
+        cache.move_to_end(side_key)
+        if cached[3] is not True and key != cached[2]:
+            if cached[3] is False:
+                cached = cache[side_key] = (
+                    *cached[:3],
+                    None
+                    if _build_all_conditions_collision_template(
+                        cached[2],
+                        side,
+                        profile_regions,
+                        missing_map_regions,
+                        check_other_side=True,
+                    )[2]
+                    else True,
+                )
+            if cached[3] is None:
+                return _build_all_conditions_collision_template(
+                    key,
+                    side,
+                    profile_regions,
+                    missing_map_regions,
+                    triangle=triangle,
+                )[:2]
+        return cached[0], cached[1]
 
     for subtree_index, subtree in enumerate(col.subtrees):
         vertices = np.asarray(subtree.vertices, dtype=np.float32)
@@ -2097,17 +2182,18 @@ def adapt_col_collision_all_conditions(
                 key = tuple(key_values)
                 cached = template_cache.get(key)
                 if cached is None:
-                    weights, vectors = _build_all_conditions_collision_template(
-                        key,
-                        profile_regions,
-                        missing_map_regions,
-                    )
+                    triangle = _collision_clip_triangle(key)
+                    first_weights, first_vectors = side_template(key, 1, triangle)
+                    second_weights, second_vectors = side_template(key, 2, triangle)
                     cached = (
-                        weights,
+                        np.array(
+                            first_weights + second_weights,
+                            dtype=np.float64,
+                        ).reshape((-1, 3, 3)),
                         np.asarray(
                             [
                                 vector_ids.setdefault(vector, len(vector_ids))
-                                for vector in vectors
+                                for vector in (*first_vectors, *second_vectors)
                             ],
                             dtype=np.int64,
                         ),

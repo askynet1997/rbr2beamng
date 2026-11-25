@@ -4,6 +4,11 @@ A plugin can define any of these:
 
 COMPANION_MOD
     The CompanionMod that the GUI offers to install.
+companion_mod_files(filename) -> Mapping[str, str]
+    Adds extra archive entries to the named companion mod zip.
+STAGE_INDICATOR
+    A StageIndicator shown beside compatible stage names in the GUI, paired
+    with ``scan_supported_stages(rbr_root, stages, cancelled)``.
 find_rx(stage, origin, map_yaw_degrees, warnings)
 find_original(lbs, texture_ini, textures, warnings)
     What the plugin needs from an RX stage or an Original variant; write_level
@@ -16,8 +21,9 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+import threading
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from functools import cache
 from pathlib import Path
@@ -31,6 +37,7 @@ if TYPE_CHECKING:
 
     from ..beamng import WaterSpec
     from ..filesystem import FileSandbox
+    from ..models import StageInspection
     from ..original.adapter import PreparedOriginalVariant
 
 
@@ -39,6 +46,14 @@ class CompanionMod:
     title: str
     filename: str
     install: Callable[[Path, FileSandbox], None]
+    indicator: str = ""
+
+
+@dataclass(frozen=True)
+class StageIndicator:
+    symbol: str
+    label: str
+    scan_order: int = 0
 
 
 @dataclass(frozen=True)
@@ -65,6 +80,51 @@ def loaded() -> tuple[ModuleType, ...]:
 
 def companion_mods() -> list[CompanionMod]:
     return [plugin.COMPANION_MOD for plugin in loaded() if hasattr(plugin, "COMPANION_MOD")]
+
+
+def companion_mod_files(filename: str) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for plugin in loaded():
+        hook = getattr(plugin, "companion_mod_files", None)
+        if hook is not None and hook is not companion_mod_files:
+            entries.update(hook(filename))
+    return entries
+
+
+def stage_indicators() -> list[StageIndicator]:
+    return [
+        plugin.STAGE_INDICATOR
+        for plugin in loaded()
+        if hasattr(plugin, "STAGE_INDICATOR")
+        and hasattr(plugin, "scan_supported_stages")
+    ]
+
+
+def scan_stage_indicators(
+    rbr_root: Path,
+    stages: Iterable[StageInspection],
+    cancelled: threading.Event,
+) -> Iterator[tuple[str, StageIndicator]]:
+    stage_list = tuple(stages)
+    plugins_with_indicators = sorted(
+        (
+            plugin
+            for plugin in loaded()
+            if hasattr(plugin, "STAGE_INDICATOR")
+            and hasattr(plugin, "scan_supported_stages")
+        ),
+        key=lambda plugin: plugin.STAGE_INDICATOR.scan_order,
+    )
+    for plugin in plugins_with_indicators:
+        if cancelled.is_set():
+            return
+        indicator = plugin.STAGE_INDICATOR
+        for source_key in plugin.scan_supported_stages(
+            rbr_root, stage_list, cancelled
+        ):
+            if cancelled.is_set():
+                return
+            yield source_key, indicator
 
 
 def find(hook: str, *arguments) -> dict[ModuleType, object]:

@@ -8,10 +8,11 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, TextIO
 
-from .filesystem import FileSandbox, SandboxViolationError
+from .filesystem import FileSandbox, SandboxViolationError, current_filesystem
 from .profiling import record_progress
 from .rsf_files import RsfDeobfuscatingSandbox
 
@@ -66,16 +67,52 @@ def slugify(value: str) -> str:
     return slug or "stage"
 
 
+def is_colliding_rx_stage(
+    folder_name: str,
+    *,
+    source_format: str = "rx",
+    rbr_root: Path | None = None,
+) -> bool:
+    if source_format != "rx" or rbr_root is None:
+        return False
+    try:
+        from .original.source import original_stage_slugs
+
+        return slugify(folder_name) in original_stage_slugs(rbr_root)
+    except Exception:
+        return False
+
+
+def stage_level_id(
+    folder_name: str,
+    *,
+    display_name: str = "",
+    source_format: str = "rx",
+    rbr_root: Path | None = None,
+) -> str:
+    if source_format == "original":
+        readable = slugify(display_name or folder_name)[:100]
+        return f"rbr_{readable}"
+    slug = slugify(folder_name)
+    if is_colliding_rx_stage(folder_name, source_format=source_format, rbr_root=rbr_root):
+        return f"rbr_{slug}_rx"
+    return f"rbr_{slug}"
+
+
 def stage_zip_name(
     folder_name: str,
     *,
     display_name: str = "",
     source_format: str = "rx",
+    rbr_root: Path | None = None,
 ) -> str:
-    if source_format == "original":
-        readable = slugify(display_name or folder_name)[:100]
-        return f"rbr_{readable}.zip"
-    return f"rbr_{slugify(folder_name)}.zip"
+    level_id = stage_level_id(
+        folder_name,
+        display_name=display_name,
+        source_format=source_format,
+        rbr_root=rbr_root,
+    )
+    return f"{level_id}.zip"
 
 
 def stable_uuid(*parts: object) -> str:

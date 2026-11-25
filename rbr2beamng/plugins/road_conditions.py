@@ -4,12 +4,19 @@ road conditions in BeamNG."""
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .. import __version__
 from ..conversion_common import install_companion_mod
 from ..filesystem import FileSandbox
-from . import CompanionMod, PluginLevel
+from . import CompanionMod, PluginLevel, StageIndicator
+from . import companion_mod_files as _companion_mod_files
+
+if TYPE_CHECKING:
+    from ..models import StageInspection
 
 
 CONDITION_SELECTOR_MOD_FILENAME = "rbr_road_conditions_selector.zip"
@@ -253,6 +260,10 @@ local function getConditionState()
   sendConditionState()
 end
 
+local function getSelectedCondition()
+  return selectedCondition
+end
+
 local function selectCondition(surface, wear)
   if type(surface) ~= "string" or type(wear) ~= "string" or playerSpeedKph() > 1 then
     return
@@ -272,6 +283,7 @@ local function selectCondition(surface, wear)
   be:reloadCollision()
   selectedCondition = {surface = surface, wear = wear}
   sendConditionState()
+  extensions.hook("onRbrRoadConditionChanged", surface, wear)
 end
 
 local function onClientStartMission()
@@ -358,6 +370,7 @@ local function onUpdate(dtReal)
 end
 
 M.getConditionState = getConditionState
+M.getSelectedCondition = getSelectedCondition
 M.selectCondition = selectCondition
 M.onClientStartMission = onClientStartMission
 M.onClientPostStartMission = onClientStartMission
@@ -386,16 +399,109 @@ def install_condition_selector_mod(destination: Path, filesystem: FileSandbox) -
             f"ui/modules/apps/{_APP_NAME}/app.vue": _APP_VUE,
             "lua/ge/extensions/rbrRoadConditions.lua": _EXTENSION,
             "scripts/rbrRoadConditions/modScript.lua": _MOD_SCRIPT,
+            **_companion_mod_files(CONDITION_SELECTOR_MOD_FILENAME),
         },
         filesystem,
     )
 
 
+STAGE_INDICATOR = StageIndicator(
+    symbol="⛅",
+    label="Multiple road conditions",
+    scan_order=0,
+)
+
 COMPANION_MOD = CompanionMod(
     "Road Conditions",
     CONDITION_SELECTOR_MOD_FILENAME,
     install_condition_selector_mod,
+    indicator=STAGE_INDICATOR.symbol,
 )
+
+
+def has_multiple_road_conditions(mat_path: Path) -> bool:
+    """Return whether a MAT file defines more than one distinct road condition."""
+    from ..filesystem import current_filesystem
+    from ..original.binary import FormatError
+    from ..original.mat import parse_mat
+
+    try:
+        mat = parse_mat(current_filesystem().read_bytes(mat_path))
+    except (OSError, FormatError):
+        return False
+    distinct_conditions = {
+        tuple(material_map.raw.tobytes() for material_map in condition.maps)
+        for condition in mat.conditions
+        if condition.maps
+    }
+    return len(distinct_conditions) > 1
+
+
+def scan_supported_stages(
+    rbr_root: Path,
+    stages: Iterable[StageInspection],
+    cancelled: threading.Event,
+) -> Iterator[str]:
+    from ..original.catalog import (
+        AmbiguousOriginalAssetError,
+        CatalogError,
+        MissingOriginalAssetError,
+    )
+    from ..original.source import (
+        ORIGINAL_REQUIRED_EXTENSIONS,
+        PRIMARY_TINT_ORDER,
+        original_catalog,
+        original_stage_id,
+    )
+
+    original_stages: list[tuple[StageInspection, int]] = []
+    for stage in stages:
+        if stage.source_format != "original" or not stage.valid:
+            continue
+        stage_id = original_stage_id(stage.source_key)
+        if stage_id is not None:
+            original_stages.append((stage, stage_id))
+    if not original_stages or cancelled.is_set():
+        return
+    try:
+        catalog = original_catalog(rbr_root)
+    except (CatalogError, OSError):
+        return
+    for stage, stage_id in original_stages:
+        if cancelled.is_set():
+            return
+        tints = stage.variants
+        if not tints:
+            try:
+                tints = tuple(
+                    tint.value
+                    for tint in catalog.complete_tints(
+                        stage_id, extensions=ORIGINAL_REQUIRED_EXTENSIONS
+                    )
+                )
+            except (CatalogError, OSError):
+                continue
+        if not tints:
+            continue
+        ordered_tints = tuple(t for t in PRIMARY_TINT_ORDER if t in tints) + tuple(
+            t for t in tints if t not in PRIMARY_TINT_ORDER
+        )
+        for tint in ordered_tints:
+            if cancelled.is_set():
+                return
+            try:
+                mat_path = catalog.resolve_file(stage_id, tint, "material")
+            except (
+                KeyError,
+                CatalogError,
+                MissingOriginalAssetError,
+                AmbiguousOriginalAssetError,
+                OSError,
+            ):
+                continue
+            if has_multiple_road_conditions(mat_path):
+                yield stage.source_key
+                break
 
 
 def write_level(level: PluginLevel) -> dict[str, int]:

@@ -17,6 +17,8 @@ Some issues are to be expected, so both bug reports and fixes are welcome.
   <a href="ingame1.jpg"><img src="ingame1.jpg" width="32%" alt="Driver cam with pacenotes" title="Driver cam with pacenotes"></a>
   <a href="ingame2.jpg"><img src="ingame2.jpg" width="32%" alt="Physics conversion details" title="Physics conversion details"></a>
   <a href="ingame3.jpg"><img src="ingame3.jpg" width="32%" alt="RBR Road Conditions mod" title="RBR Road Conditions mod"></a>
+  <br>
+  <a href="start_clocks.webp"><img src="start_clocks.webp" width="97%" alt="Working RBR start countdown clocks (Warthog, TAG Heuer, ALGE-TIMING, Certina)" title="Working RBR start countdown clocks (Warthog, TAG Heuer, ALGE-TIMING, Certina)"></a>
 </p>
 
 ## How to convert a stage with GUI (using prebuilt binaries)
